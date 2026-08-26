@@ -2,6 +2,7 @@
 import matter from 'gray-matter';
 import { unified } from 'unified';
 import remarkParse from 'remark-parse';
+import remarkMath from 'remark-math';
 import { ParsedMarkdown, WolaiBlock, MarkdownNode, SyncStatus, FileSyncInfo, CreateRichText, WolaiRichText, WolaiPageBlock } from './types';
 
 export class MarkdownParser {
@@ -77,7 +78,9 @@ export class MarkdownParser {
 
     parseMarkdownToAST(content: string): MarkdownNode | null {
         try {
-            const processor = unified().use(remarkParse as any);
+            const processor = unified()
+                .use(remarkParse as any)
+                .use(remarkMath as any);
             const ast = processor.parse(content);
             return ast as MarkdownNode;
         } catch (error) {
@@ -154,6 +157,12 @@ export class MarkdownParser {
                 return {
                     type: 'quote',
                     content: this.extractRichTextFromNode(node)
+                };
+
+            case 'math':
+                return {
+                    type: 'block_equation',
+                    content: node.value || ''
                 };
 
             default:
@@ -323,6 +332,12 @@ export class MarkdownParser {
                 return {
                     title: node.value || '',
                     inline_code: true
+                };
+
+            case 'inlineMath':
+                return {
+                    type: 'equation',
+                    title: node.value || ''
                 };
 
             case 'delete': // ~~删除线~~
@@ -496,9 +511,10 @@ export class MarkdownParser {
                 blockContent = this.convertRichTextToMarkdown(block.content) || '*[表格内容]*';
                 break;
 
+            case 'block_equation':
             case 'equation':
                 // 数学公式
-                const equation = this.convertRichTextToMarkdown(block.content);
+                const equation = this.extractEquationContent(block.content);
                 blockContent = `$$\n${equation}\n$$`;
                 break;
 
@@ -547,6 +563,10 @@ export class MarkdownParser {
         const richText = content as WolaiRichText;
         let result = richText.title || '';
 
+        if (richText.type === 'equation') {
+            return `$${result}$`;
+        }
+
         // 应用格式
         if (richText.bold) {
             result = `**${result}**`;
@@ -565,5 +585,14 @@ export class MarkdownParser {
         }
 
         return result;
+    }
+
+    private extractEquationContent(content?: CreateRichText): string {
+        if (!content) return '';
+        if (typeof content === 'string') return content;
+        if (Array.isArray(content)) {
+            return content.map(item => this.extractEquationContent(item)).join('');
+        }
+        return content.title || '';
     }
 }

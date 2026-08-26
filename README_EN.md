@@ -13,6 +13,7 @@ An Obsidian community plugin for synchronizing Markdown notes, database records,
 - Direct synchronization of ordinary Wolai pages in addition to database records, including recursive child pages.
 - Page hierarchy mapping: every Wolai child page becomes an independent Markdown file under its parent's directory.
 - Incremental images stored in the corresponding page's `pictures/` directory.
+- Math conversion between Wolai inline/block equations and Obsidian MathJax `$...$` / `$$...$$` syntax.
 - Per-page checkpoints so interrupted or paused jobs can continue during the next incremental synchronization.
 - Local rolling-hour API quota control with slow synchronization and automatic continuation.
 - Pause, resume, and stop controls for full and incremental jobs.

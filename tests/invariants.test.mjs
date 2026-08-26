@@ -81,3 +81,14 @@ test('runtime files use the installed plugin directory', async () => {
     assert.match(manager, /pluginDirectory: string/);
     assert.doesNotMatch(manager, /obsidian-wolai-sync-master/);
 });
+
+test('Wolai and Obsidian math syntax is converted in both directions', async () => {
+    const parser = await read('src/MarkdownParser.ts');
+    const pkg = JSON.parse(await read('package.json'));
+    assert.ok(pkg.devDependencies['remark-math']);
+    assert.match(parser, /\.use\(remarkMath as any\)/);
+    assert.match(parser, /case 'math':[\s\S]*type: 'block_equation'/);
+    assert.match(parser, /case 'inlineMath':[\s\S]*type: 'equation'/);
+    assert.match(parser, /case 'block_equation':\s*case 'equation':/);
+    assert.match(parser, /richText\.type === 'equation'/);
+});
