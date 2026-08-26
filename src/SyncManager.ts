@@ -18,6 +18,7 @@ interface WolaiPageSyncState {
     relativeDir: string;
     remoteVersion: number;
     remoteEditedAt: number;
+    converterVersion?: number;
     children: Array<{ pageId: string; title: string; relativeDir: string }>;
     images: Record<string, { version: number; editedAt: number; path: string }>;
 }
@@ -31,6 +32,7 @@ interface PageProgressContext {
 }
 
 export class SyncManager {
+    private readonly converterVersion = 2;
     private progressListeners = new Set<(percent: number, message: string) => void>();
     private logListeners = new Set<(line: string) => void>();
     private apiStatsListeners = new Set<(stats: APICallStats) => void>();
@@ -871,6 +873,7 @@ export class SyncManager {
             const metadata = await this.getPageMetadataLimited(row.page_id);
 
             const canFastSkip = mode === 'incremental' && previousPage &&
+                previousPage.converterVersion === this.converterVersion &&
                 previousPage.remoteVersion === Number(metadata.version || 0) &&
                 previousPage.remoteEditedAt === Number(metadata.edited_at || 0) &&
                 previousPage.filePath === fullFilePath &&
@@ -924,6 +927,7 @@ export class SyncManager {
             );
             const fingerprint = this.createPageFingerprint(parentPageBlocks);
             const pageChanged = mode === 'full' || !previousPage || previousPage.fingerprint !== fingerprint ||
+                previousPage.converterVersion !== this.converterVersion ||
                 previousPage.filePath !== fullFilePath || !(this.vault.getAbstractFileByPath(fullFilePath) instanceof TFile);
             const imageResult = await this.downloadPageImages(
                 parentPageBlocks as any[], pageName, relativeDir, generatedFiles,
@@ -1002,6 +1006,7 @@ export class SyncManager {
                 relativeDir,
                 remoteVersion: Number(metadata.version || 0),
                 remoteEditedAt: Number(metadata.edited_at || 0),
+                converterVersion: this.converterVersion,
                 children: childDescriptors,
                 images: imageResult.images
             };

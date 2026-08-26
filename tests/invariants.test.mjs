@@ -92,3 +92,11 @@ test('Wolai and Obsidian math syntax is converted in both directions', async () 
     assert.match(parser, /case 'block_equation':\s*case 'equation':/);
     assert.match(parser, /richText\.type === 'equation'/);
 });
+
+test('converter upgrades invalidate Markdown without forcing full image downloads', async () => {
+    const manager = await read('src/SyncManager.ts');
+    assert.match(manager, /converterVersion = 2/);
+    assert.match(manager, /previousPage\.converterVersion === this\.converterVersion/);
+    assert.match(manager, /previousPage\.converterVersion !== this\.converterVersion/);
+    assert.match(manager, /converterVersion: this\.converterVersion/);
+});
