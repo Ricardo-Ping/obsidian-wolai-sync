@@ -1,5 +1,7 @@
 # Obsidian Wolai Sync
 
+[简体中文](README.md) | [English](README_EN.md)
+
 在 Obsidian 与 Wolai（我来）之间同步 Markdown 页面、数据库记录、子页面和图片的社区插件。
 
 > 本项目基于 [MarswayRed/obsidian-wolai-sync](https://github.com/MarswayRed/obsidian-wolai-sync) 继续开发，保留原项目的版权与许可证，并由 [Ricardo-Ping](https://github.com/Ricardo-Ping) 维护增强版本。感谢原作者 Li Wei 和原项目提供的基础实现。
