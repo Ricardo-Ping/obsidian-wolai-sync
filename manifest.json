@@ -1,0 +1,10 @@
+{
+	"id": "wolai-sync",
+	"name": "Wolai Sync",
+	"version": "1.1.0",
+	"minAppVersion": "0.15.0",
+	"description": "Incremental two-way sync for Wolai pages, databases, child pages and images.",
+	"author": "Ricardo_PING",
+	"authorUrl": "https://github.com/Ricardo-Ping",
+	"isDesktopOnly": false
+}
