@@ -86,6 +86,16 @@ Reads lightweight metadata first and skips unchanged pages. Changed pages are fe
 
 Writes pending Obsidian files to Wolai without running Wolai → Obsidian synchronization. Files with `wolai_id` update that page in place; files without one create a database record. Missing local files do not delete Wolai pages.
 
+### Upgrading legacy state (1.3.1)
+
+Reload the plugin and run incremental two-way sync; do not clear checkpoints or start over with a full sync. If a legacy record has no content hash, its Wolai page is read to verify the body first. File size or modification time alone never triggers an upload.
+
+- Matching bodies: preserve the local body and custom properties, refresh the baseline, clear false `Conflict` / `localDirty` markers left by 1.3.0, and continue to child pages.
+- Missing historical baseline and different bodies: retain the local note, save a Wolai copy, and report `SYNC_BASELINE_UNKNOWN` for manual review instead of guessing which side is correct.
+- Known baselines with genuinely conflicting edits still receive conflict protection.
+
+Initial verification of legacy pages requires API requests. Subsequent runs can fast-skip using the new baselines. Upgrading does not clear existing checkpoints or conflict copies.
+
 ## Output Layout
 
 For a Wolai parent page named `Database Query Rewriting` with a child page named `GRewriter`:

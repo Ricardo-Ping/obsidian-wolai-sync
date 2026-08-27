@@ -468,12 +468,11 @@ export class SyncManager {
         return this.markdownParser.createHash(await this.vault.read(file));
     }
 
-    private async legacyGeneratedFileWasModified(filePath: string): Promise<boolean> {
-        const manifest = await this.loadGeneratedManifestCache();
-        const file = this.vault.getAbstractFileByPath(filePath);
-        const entry = manifest[filePath];
-        return file instanceof TFile && Boolean(entry) &&
-            (file.stat.size !== entry.size || file.stat.mtime !== entry.mtime);
+    private markdownBodiesEqual(localContent: string, remoteMarkdown: string): boolean {
+        // Sync metadata is not note content. Only normalize line endings and
+        // boundary blank lines; preserve indentation and Markdown hard breaks.
+        const normalizeBody = (body: string): string => body.replace(/\r\n?/g, '\n').replace(/^\n+|\n+$/g, '');
+        return normalizeBody(matter(localContent).content) === normalizeBody(remoteMarkdown);
     }
 
     private isExpectedInternalWrite(filePath: string, content: string): boolean {
@@ -496,15 +495,22 @@ export class SyncManager {
         const content = await this.vault.read(file);
         if (this.isExpectedInternalWrite(filePath, content)) return false;
         const parsed = this.markdownParser.parseMarkdown(content);
-        if (this.markdownParser.needsSync(parsed.frontMatter)) return true;
         const pageId = String(parsed.frontMatter.wolai_id || '');
-        if (!pageId || parsed.frontMatter.sync_status !== 'Synced') return false;
+        if (!pageId) return this.markdownParser.needsSync(parsed.frontMatter);
+        if (parsed.frontMatter.sync_status === 'Conflict') return false;
         const state = await this.loadIncrementalState();
         const baseline = state[pageId]?.localHash || this.syncRecords.get(filePath)?.hash ||
             await this.getGeneratedBaselineHash(filePath);
-        const contentChanged = baseline
-            ? baseline !== this.markdownParser.createHash(content)
-            : Boolean(state[pageId] && await this.legacyGeneratedFileWasModified(filePath));
+        if (!baseline) {
+            // A stale size/mtime manifest proves neither a user edit nor a
+            // conflict. Let inbound reconciliation establish a content baseline
+            // before permitting an upload of an already-linked legacy note.
+            void this.writeSyncLog('INFO', `缺少本地内容基线，等待与 Wolai 正文核验，不自动上传：${filePath}`);
+            return false;
+        }
+        if (this.markdownParser.needsSync(parsed.frontMatter)) return true;
+        if (parsed.frontMatter.sync_status !== 'Synced') return false;
+        const contentChanged = baseline !== this.markdownParser.createHash(content);
         if (!contentChanged) return false;
         const updated = this.markdownParser.updateSyncStatus(content, 'Modified', pageId);
         this.markInternalWrite(filePath, updated);
@@ -706,6 +712,12 @@ export class SyncManager {
             const pendingLocalHash = this.markdownParser.createHash(content);
 
             if (linkedPageId) {
+                const localBaseline = previousPage?.localHash || previousRecord?.hash ||
+                    await this.getGeneratedBaselineHash(filePath);
+                if (!localBaseline) {
+                    void this.writeSyncLog('WARN', `SYNC_BASELINE_UNKNOWN: 已阻止上传缺少本地基线的旧页面，请运行增量双向同步核验正文：${filePath}`);
+                    return false;
+                }
                 const metadataBefore: WolaiBlockMetadata = await this.getPageMetadataLimited(linkedPageId);
                 const baselineVersion = previousPage?.remoteVersion ?? previousRecord?.remoteVersion;
                 const baselineEditedAt = previousPage?.remoteEditedAt ?? previousRecord?.remoteEditedAt;
@@ -727,8 +739,37 @@ export class SyncManager {
                     const remoteParentBlocks = remoteBlocks.filter(block =>
                         !block.parentBlockId || !remoteChildIds.has(block.parentBlockId));
                     remoteConflictMarkdown = this.markdownParser.convertWolaiPageToMarkdown(remoteParentBlocks, title);
+                    const remoteFingerprint = this.createPageFingerprint(remoteParentBlocks);
+                    const remoteComparableMarkdown = this.renderPageMarkdown(remoteParentBlocks,
+                        previousPage.title, linkedPageId, previousPage.relativeDir);
+                    if (this.markdownBodiesEqual(content, remoteComparableMarkdown)) {
+                        if (await this.vault.read(file) !== content) {
+                            throw new Error(`SYNC_LOCAL_CHANGED: 上传核验期间本地文件变化，请重试：${filePath}`);
+                        }
+                        const reconciledContent = this.markdownParser.updateSyncStatus(content, 'Synced', linkedPageId);
+                        this.markInternalWrite(filePath, reconciledContent);
+                        await this.vault.modify(file, reconciledContent);
+                        const hash = this.markdownParser.createHash(reconciledContent);
+                        this.syncRecords.set(filePath, {
+                            filePath, wolaiRowId: linkedPageId, synced: true, hash,
+                            lastModified: file.stat.mtime,
+                            remoteVersion: Number(metadataBefore.version || 0),
+                            remoteEditedAt: Number(metadataBefore.edited_at || 0)
+                        });
+                        await this.saveSyncRecords();
+                        await this.appendIncrementalCheckpoint(linkedPageId, {
+                            ...previousPage, fingerprint: remoteFingerprint, localHash: hash, localDirty: false,
+                            remoteVersion: Number(metadataBefore.version || 0),
+                            remoteEditedAt: Number(metadataBefore.edited_at || 0),
+                            // Inbound traversal still needs to refresh child/image
+                            // descriptors before the normal fast-skip path is safe.
+                            converterVersion: undefined
+                        });
+                        void this.writeSyncLog('INFO', `正文一致，已更新基线，无需上传或生成冲突：${filePath}`);
+                        return true;
+                    }
                     remoteChanged = remoteChanged ||
-                        this.createPageFingerprint(remoteParentBlocks) !== previousPage.fingerprint;
+                        remoteFingerprint !== previousPage.fingerprint;
                 }
                 const recoveringInterruptedUpdate = previousRecord?.updateInProgress === true &&
                     previousRecord.pendingHash === pendingLocalHash &&
@@ -1063,6 +1104,27 @@ export class SyncManager {
         }
     }
 
+    private getPageImagePath(block: any, pageName: string, relativeDir: string): string | undefined {
+        const url = block.media?.download_url || block.url;
+        if (block.type !== 'image' || !url) return undefined;
+        const extensionMatch = url.split('?')[0].match(/\.([A-Za-z0-9]{2,5})$/);
+        const extension = extensionMatch ? extensionMatch[1].toLowerCase() : 'png';
+        return normalizePath([
+            this.settings.obsidianFolder || 'Wolai', relativeDir,
+            pageName.replace(/[<>:"/\\|?*]/g, '_'), 'pictures', `${block.id}.${extension}`
+        ].filter(Boolean).join('/'));
+    }
+
+    private renderPageMarkdown(blocks: any[], pageName: string, pageId: string,
+        relativeDir: string, localImages = true): string {
+        if (blocks.length === 0) return `# ${pageName}\n\n*此页面从 Wolai 同步，页面ID: ${pageId}*\n\n`;
+        const renderedBlocks = blocks.map(block => ({
+            ...block,
+            localPath: localImages ? this.getPageImagePath(block, pageName, relativeDir) : undefined
+        }));
+        return this.markdownParser.convertWolaiPageToMarkdown(renderedBlocks, pageName);
+    }
+
     private async downloadPageImages(
         blocks: any[],
         pageName: string,
@@ -1089,10 +1151,8 @@ export class SyncManager {
             if (!downloadUrl) continue;
 
             try {
-                const urlWithoutQuery = downloadUrl.split('?')[0];
-                const extensionMatch = urlWithoutQuery.match(/\.([A-Za-z0-9]{2,5})$/);
-                const extension = extensionMatch ? extensionMatch[1].toLowerCase() : 'png';
-                const localPath = normalizePath(`${attachmentFolder}/${block.id}.${extension}`);
+                const localPath = this.getPageImagePath(block, pageName, relativeDir);
+                if (!localPath) continue;
                 const existing = this.vault.getAbstractFileByPath(localPath);
                 const version = Number(block.version || 0);
                 const editedAt = Number(block.edited_at || 0);
@@ -1138,6 +1198,7 @@ export class SyncManager {
     ): Promise<boolean> {
         try {
             await this.waitIfPaused();
+            await this.syncRecordsReady;
             if (visitedPageIds.has(row.page_id)) return true;
             visitedPageIds.add(row.page_id);
             // 提取文件信息
@@ -1155,10 +1216,26 @@ export class SyncManager {
             );
             const previousPage = previousState[row.page_id];
             const previousRecord = this.syncRecords.get(fullFilePath);
+            const existingFile = this.vault.getAbstractFileByPath(fullFilePath);
+            const existingContent = existingFile instanceof TFile ? await this.vault.read(existingFile) : '';
+            const existingData = existingFile instanceof TFile ? matter(existingContent).data : {};
+            if (existingData.wolai_id && existingData.wolai_id !== row.page_id) {
+                throw new Error(`SYNC_PATH_CONFLICT: 目标文件属于其他 Wolai 页面，未覆盖：${fullFilePath}`);
+            }
+            const currentLocalHash = this.markdownParser.createHash(existingContent);
+            const effectiveBaselineHash = previousPage?.localHash || previousRecord?.hash ||
+                await this.getGeneratedBaselineHash(fullFilePath);
+            const unknownLocalBaseline = existingFile instanceof TFile && !effectiveBaselineHash;
+            const explicitlyDirty = existingData.sync_status === 'Modified' || existingData.sync_status === 'Conflict';
+            const localModified = Boolean(existingFile instanceof TFile &&
+                (explicitlyDirty || previousPage?.localDirty ||
+                    (effectiveBaselineHash && currentLocalHash !== effectiveBaselineHash)));
             const localStateIsUsable = Boolean(previousPage &&
                 previousPage.converterVersion === this.converterVersion &&
                 previousPage.filePath === fullFilePath &&
-                this.vault.getAbstractFileByPath(fullFilePath) instanceof TFile &&
+                existingFile instanceof TFile && effectiveBaselineHash &&
+                currentLocalHash === effectiveBaselineHash && !localModified &&
+                existingData.sync_status === 'Synced' &&
                 Object.values(previousPage.images || {}).every(image =>
                     this.vault.getAbstractFileByPath(image.path) instanceof TFile) &&
                 Array.isArray(previousPage.children));
@@ -1168,7 +1245,7 @@ export class SyncManager {
             // an ordinary new run still checks Wolai for remote changes.
             const resumablePage = localStateIsUsable ? previousPage : undefined;
             if (mode === 'incremental' && resumeState?.verifiedPageIds[row.page_id] && resumablePage) {
-                const resumedHash = resumablePage.localHash || await this.getGeneratedBaselineHash(fullFilePath);
+                const resumedHash = effectiveBaselineHash;
                 const resumedState = resumedHash ? {
                     ...resumablePage,
                     localHash: resumedHash
@@ -1196,7 +1273,7 @@ export class SyncManager {
                 previousPage.remoteEditedAt === Number(metadata.edited_at || 0) &&
                 previousPage.filePath === fullFilePath;
             if (canFastSkip) {
-                const fastHash = previousPage.localHash || await this.getGeneratedBaselineHash(fullFilePath);
+                const fastHash = effectiveBaselineHash;
                 const fastState = fastHash ? {
                     ...previousPage,
                     localHash: fastHash
@@ -1263,85 +1340,72 @@ export class SyncManager {
             const pageChanged = mode === 'full' || actualRemoteChanged ||
                 previousPage?.converterVersion !== this.converterVersion ||
                 previousPage?.filePath !== fullFilePath || !(this.vault.getAbstractFileByPath(fullFilePath) instanceof TFile);
+            // Compare the actual rendered note before classifying a conflict.
+            // Legacy/Conflict flags and missing baselines are not proof of two
+            // different contents. Map image paths without downloading anything.
+            const markdownContent = this.renderPageMarkdown(parentPageBlocks, pageName, row.page_id, relativeDir);
+            const bodiesEqual = existingFile instanceof TFile &&
+                this.markdownBodiesEqual(existingContent, markdownContent);
+            if (existingFile instanceof TFile && await this.vault.read(existingFile) !== existingContent) {
+                throw new Error(`SYNC_LOCAL_CHANGED: 核验期间本地文件发生变化，已保留，请重试：${fullFilePath}`);
+            }
+            if (!bodiesEqual && (unknownLocalBaseline || (localModified && actualRemoteChanged))) {
+                const conflictPath = await this.writeConflictCopy(fullFilePath, row.page_id,
+                    this.renderPageMarkdown(parentPageBlocks, pageName, row.page_id, relativeDir, false));
+                if (unknownLocalBaseline) {
+                    throw new Error(`SYNC_BASELINE_UNKNOWN: 缺少历史内容基线且正文不同，未覆盖本地；Wolai 副本：${conflictPath}`);
+                }
+                throw new Error(`SYNC_CONFLICT: local and Wolai changed; remote copy saved to ${conflictPath}`);
+            }
             const imageResult = await this.downloadPageImages(
                 parentPageBlocks as any[], pageName, relativeDir, generatedFiles,
-                mode, previousPage?.images || {}
+                localModified ? 'incremental' : mode, previousPage?.images || {}
             );
-            if (pageChanged || imageResult.changed) changedPages?.add(row.page_id);
-
-            let markdownContent = '';
-            if (pageChanged && parentPageBlocks.length > 0) {
-                // 转换Wolai页面内容为Markdown
-                markdownContent = this.markdownParser.convertWolaiPageToMarkdown(parentPageBlocks, pageName);
-                console.log(`Converted ${pageBlocks.length} blocks to markdown for ${pageName}`);
-            } else if (pageChanged) {
-                // 如果没有内容，创建基础内容
-                markdownContent = `# ${pageName}\n\n*此页面从 Wolai 同步，页面ID: ${row.page_id}*\n\n`;
-                console.log(`No blocks found for page ${row.page_id}, using placeholder content`);
+            if (existingFile instanceof TFile && await this.vault.read(existingFile) !== existingContent) {
+                throw new Error(`SYNC_LOCAL_CHANGED: 下载图片期间本地文件发生变化，已保留，请重试：${fullFilePath}`);
             }
 
-            let writtenLocalHash = previousPage?.localHash;
+            let writtenLocalHash = effectiveBaselineHash;
             let resultingLocalDirty = Boolean(previousPage?.localDirty);
-            if (pageChanged) {
-                const fullContent = matter.stringify(markdownContent, frontMatter);
-                const existingFile = this.vault.getAbstractFileByPath(fullFilePath);
-                const existingContent = existingFile instanceof TFile ? await this.vault.read(existingFile) : '';
-                const currentLocalHash = existingContent ? this.markdownParser.createHash(existingContent) : '';
-                const legacyBaselineHash = (previousPage || previousRecord) &&
-                    !previousPage?.localHash && !previousRecord?.hash
-                    ? await this.getGeneratedBaselineHash(fullFilePath) : undefined;
-                const effectiveBaselineHash = previousPage?.localHash || previousRecord?.hash || legacyBaselineHash;
-                const existingStatus = existingContent
-                    ? this.markdownParser.parseMarkdown(existingContent).frontMatter.sync_status : undefined;
-                const explicitlyDirty = existingStatus === 'Modified' || existingStatus === 'Conflict';
-                const unknownLegacyBaseline = Boolean(existingFile instanceof TFile &&
-                    (previousPage || previousRecord) && !effectiveBaselineHash);
-                const localModified = Boolean(existingFile instanceof TFile &&
-                    (explicitlyDirty || previousPage?.localDirty || unknownLegacyBaseline ||
-                        (!this.outboundUpdatedPageIds.has(row.page_id) &&
-                            effectiveBaselineHash && currentLocalHash !== effectiveBaselineHash)));
-                if (localModified && actualRemoteChanged) {
-                    const conflictPath = await this.writeConflictCopy(fullFilePath, row.page_id, markdownContent);
-                    throw new Error(`SYNC_CONFLICT: local and Wolai changed; remote copy saved to ${conflictPath}`);
+            let pageWritten = false;
+            let baselineReconciled = false;
+            if (bodiesEqual && existingFile instanceof TFile) {
+                // Preserve local note properties and body; repair only sync
+                // metadata. This also clears false 1.3.0 Conflict/localDirty flags.
+                const reconciledContent = existingData.sync_status === 'Synced' && existingData.wolai_id === row.page_id
+                    ? existingContent : this.markdownParser.updateSyncStatus(existingContent, 'Synced', row.page_id);
+                if (reconciledContent !== existingContent) {
+                    this.markInternalWrite(fullFilePath, reconciledContent);
+                    await this.vault.modify(existingFile, reconciledContent);
                 }
-                if (localModified) {
-                    void this.writeSyncLog('WARN', `保留本地修改，未用完整同步覆盖：${fullFilePath}`);
-                    const markedContent = this.markdownParser.updateSyncStatus(existingContent, 'Modified', row.page_id);
-                    this.markInternalWrite(fullFilePath, markedContent);
-                    await this.vault.modify(existingFile as TFile, markedContent);
-                    writtenLocalHash = effectiveBaselineHash || currentLocalHash;
-                    resultingLocalDirty = true;
-                } else if (existingFile && existingFile instanceof TFile) {
-                // 更新现有文件
+                writtenLocalHash = this.markdownParser.createHash(reconciledContent);
+                resultingLocalDirty = false;
+                baselineReconciled = unknownLocalBaseline || localModified ||
+                    previousPage?.converterVersion !== this.converterVersion;
+                if (baselineReconciled) {
+                    void this.writeSyncLog('INFO', `正文一致，已核验并更新同步基线（清除旧冲突标记，保留本地属性）：${fullFilePath}`);
+                }
+            } else if (localModified && existingFile instanceof TFile) {
+                void this.writeSyncLog('WARN', `保留本地修改，未用完整同步覆盖：${fullFilePath}`);
+                const markedContent = this.markdownParser.updateSyncStatus(existingContent, 'Modified', row.page_id);
+                this.markInternalWrite(fullFilePath, markedContent);
+                await this.vault.modify(existingFile, markedContent);
+                resultingLocalDirty = true;
+            } else if (pageChanged) {
+                const fullContent = matter.stringify(markdownContent, frontMatter);
+                if (existingFile instanceof TFile) {
                     this.markInternalWrite(fullFilePath, fullContent);
                     await this.vault.modify(existingFile, fullContent);
-                    writtenLocalHash = this.markdownParser.createHash(fullContent);
-                    resultingLocalDirty = false;
-                    console.log(`Updated changed file: ${fullFilePath}`);
                 } else {
-                // 创建新文件（确保目录存在）
-                const dirPath = fullFilePath.substring(0, fullFilePath.lastIndexOf('/'));
-                if (dirPath && dirPath !== '' && !this.vault.getAbstractFileByPath(dirPath)) {
-                    try {
-                        await this.ensureFolder(dirPath);
-                        console.log(`Created directory: ${dirPath}`);
-                    } catch (error) {
-                        console.error(`Failed to create directory ${dirPath}:`, error);
-                        // 如果目录创建失败，尝试在根目录创建文件
-                    }
+                    const dirPath = fullFilePath.substring(0, fullFilePath.lastIndexOf('/'));
+                    if (dirPath) await this.ensureFolder(dirPath);
+                    await this.vault.create(fullFilePath, fullContent);
                 }
-
-                    try {
-                        await this.vault.create(fullFilePath, fullContent);
-                        writtenLocalHash = this.markdownParser.createHash(fullContent);
-                        resultingLocalDirty = false;
-                        console.log(`Created new file: ${fullFilePath}`);
-                    } catch (error) {
-                        console.error(`Failed to create file ${fullFilePath}:`, error);
-                        throw error;
-                    }
-                }
+                writtenLocalHash = this.markdownParser.createHash(fullContent);
+                resultingLocalDirty = false;
+                pageWritten = true;
             }
+            if (pageWritten || imageResult.changed) changedPages?.add(row.page_id);
             generatedFiles?.add(fullFilePath);
 
             const childDescriptors: Array<{ pageId: string; title: string; relativeDir: string }> = [];
@@ -1404,7 +1468,7 @@ export class SyncManager {
             }
 
             void this.writeSyncLog('INFO',
-                `页面处理完成：${fullFilePath}；页面=${pageChanged ? '已更新' : '未变更'}；图片=${Object.keys(imageResult.images).length}；子页面=${childDescriptors.length}`);
+                `页面处理完成：${fullFilePath}；页面=${pageWritten ? '已更新' : baselineReconciled ? '正文一致，基线已更新' : resultingLocalDirty ? '保留本地修改' : '未变更'}；图片=${Object.keys(imageResult.images).length}；子页面=${childDescriptors.length}`);
 
             return true;
 
