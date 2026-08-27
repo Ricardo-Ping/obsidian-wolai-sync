@@ -26,24 +26,34 @@ export default class WolaiSyncPlugin extends Plugin {
 	fileWatcher: FileWatcher;
 	statusBarItemEl: HTMLElement;
 	syncIntervalId: number | null = null;
+	private pendingFileSyncs = new Set<string>();
+	private fileQueueRunning = false;
+	private fileQueueStopped = false;
+	private fileQueuePath = '';
+	private fileQueueWrite: Promise<void> = Promise.resolve();
+	private fileQueueRetryTimer: number | null = null;
 
 	async onload() {
+		this.fileQueueStopped = false;
 		console.log('Plugin: Obsidian Wolai Sync loaded');
 		new Notice('Wolai Sync plugin loaded');
 		await this.loadSettings();
 
 		// 初始化同步管理器
 		const pluginDirectory = this.manifest.dir || `.obsidian/plugins/${this.manifest.id}`;
+		this.fileQueuePath = `${pluginDirectory}/wolai-file-queue.json`;
 		this.syncManager = new SyncManager(this.app.vault, this.settings, pluginDirectory);
+		await this.loadFileSyncQueue();
 		this.syncManager.addProgressListener((percent, message) => {
 			this.updateStatusBar(`${percent}% ${message}`);
 		});
 
 		// 初始化文件监听器
 		this.initializeFileWatcher();
+		if (this.settings.enableFileWatcher) void this.processFileSyncQueue();
 
 		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('refresh-ccw-dot', 'Wolai Sync', async (evt: MouseEvent) => {
+		const ribbonIconEl = this.addRibbonIcon('refresh-ccw-dot', 'Wolai Sync', async () => {
 			// 执行手动同步
 			await this.performManualSync();
 		});
@@ -87,6 +97,12 @@ export default class WolaiSyncPlugin extends Plugin {
 	}
 
 	onunload() {
+		this.fileQueueStopped = true;
+		this.pendingFileSyncs.clear();
+		if (this.fileQueueRetryTimer !== null) {
+			window.clearTimeout(this.fileQueueRetryTimer);
+			this.fileQueueRetryTimer = null;
+		}
 		console.log('Plugin: Obsidian Wolai Sync unloaded. Bye bye~');
 		this.syncManager?.cancelSync('插件已卸载');
 
@@ -119,6 +135,12 @@ export default class WolaiSyncPlugin extends Plugin {
 			this.fileWatcher.stopWatching();
 		}
 		this.initializeFileWatcher();
+		if (this.settings.enableFileWatcher) {
+			void this.processFileSyncQueue();
+		} else if (this.fileQueueRetryTimer !== null) {
+			window.clearTimeout(this.fileQueueRetryTimer);
+			this.fileQueueRetryTimer = null;
+		}
 
 		// 重新设置定时同步
 		this.setupScheduledSync();
@@ -129,13 +151,13 @@ export default class WolaiSyncPlugin extends Plugin {
 			this.app.vault,
 			this.settings.obsidianFolder,
 			{
-				onFileChange: async (filePath: string) => {
+				onFileChange: (filePath: string) => {
 					console.log(`File changed: ${filePath}`);
-					await this.syncSingleFile(filePath);
+					this.enqueueFileSync(filePath);
 				},
-				onFileCreate: async (filePath: string) => {
+				onFileCreate: (filePath: string) => {
 					console.log(`File created: ${filePath}`);
-					await this.syncSingleFile(filePath);
+					this.enqueueFileSync(filePath);
 				},
 				onFileDelete: async (filePath: string) => {
 					console.log(`File deleted: ${filePath}`);
@@ -154,22 +176,96 @@ export default class WolaiSyncPlugin extends Plugin {
 		}
 	}
 
-	private async syncSingleFile(filePath: string): Promise<void> {
+	private enqueueFileSync(filePath: string): void {
+		this.pendingFileSyncs.add(filePath);
+		void this.saveFileSyncQueue();
+		if (this.settings.enableFileWatcher) void this.processFileSyncQueue();
+	}
+
+	private async loadFileSyncQueue(): Promise<void> {
+		try {
+			if (!this.fileQueuePath) return;
+			const backupPath = `${this.fileQueuePath}.bak`;
+			const source = await this.app.vault.adapter.exists(this.fileQueuePath) ? this.fileQueuePath :
+				await this.app.vault.adapter.exists(backupPath) ? backupPath : '';
+			if (!source) return;
+			const paths = JSON.parse(await this.app.vault.adapter.read(source));
+			if (Array.isArray(paths)) for (const path of paths) if (typeof path === 'string') this.pendingFileSyncs.add(path);
+		} catch (error) {
+			console.error('Failed to load Wolai file queue:', error);
+		}
+	}
+
+	private async saveFileSyncQueue(): Promise<void> {
+		if (!this.fileQueuePath) return;
+		const snapshot = JSON.stringify([...this.pendingFileSyncs], null, 2);
+		this.fileQueueWrite = this.fileQueueWrite.catch(() => undefined).then(async () => {
+			const temporaryPath = `${this.fileQueuePath}.tmp`;
+			const backupPath = `${this.fileQueuePath}.bak`;
+			await this.app.vault.adapter.write(temporaryPath, snapshot);
+			if (await this.app.vault.adapter.exists(backupPath)) await this.app.vault.adapter.remove(backupPath);
+			if (await this.app.vault.adapter.exists(this.fileQueuePath)) {
+				await this.app.vault.adapter.rename(this.fileQueuePath, backupPath);
+			}
+			try {
+				await this.app.vault.adapter.rename(temporaryPath, this.fileQueuePath);
+				if (await this.app.vault.adapter.exists(backupPath)) await this.app.vault.adapter.remove(backupPath);
+			} catch (error) {
+				if (!await this.app.vault.adapter.exists(this.fileQueuePath) &&
+					await this.app.vault.adapter.exists(backupPath)) {
+					await this.app.vault.adapter.rename(backupPath, this.fileQueuePath);
+				}
+				throw error;
+			}
+		});
+		await this.fileQueueWrite;
+	}
+
+	private async processFileSyncQueue(): Promise<void> {
+		if (this.fileQueueRunning) return;
+		this.fileQueueRunning = true;
+		try {
+			while (!this.fileQueueStopped && this.settings.enableFileWatcher && this.pendingFileSyncs.size > 0) {
+				if (this.syncManager.isSyncActive()) {
+					await new Promise(resolve => window.setTimeout(resolve, 1000));
+					continue;
+				}
+				const filePath = this.pendingFileSyncs.values().next().value as string | undefined;
+				if (!filePath) break;
+				const completed = await this.syncSingleFile(filePath);
+				if (!completed) {
+					await this.saveFileSyncQueue();
+					this.scheduleFileQueueRetry();
+					break;
+				}
+				this.pendingFileSyncs.delete(filePath);
+				await this.saveFileSyncQueue();
+			}
+		} finally {
+			this.fileQueueRunning = false;
+		}
+	}
+
+	private scheduleFileQueueRetry(): void {
+		if (this.fileQueueRetryTimer !== null || this.fileQueueStopped || !this.settings.enableFileWatcher) return;
+		this.fileQueueRetryTimer = window.setTimeout(() => {
+			this.fileQueueRetryTimer = null;
+			void this.processFileSyncQueue();
+		}, 5 * 60 * 1000);
+	}
+
+	private async syncSingleFile(filePath: string): Promise<boolean> {
 		try {
 			// 检查文件是否需要同步
 			const file = this.app.vault.getAbstractFileByPath(filePath) as TFile;
 			if (!file || !(file instanceof TFile)) {
 				console.log(`File not found or not a markdown file: ${filePath}`);
-				return;
+				return true;
 			}
 
-			const content = await this.app.vault.read(file);
-			const parsedMarkdown = this.syncManager.markdownParser.parseMarkdown(content);
-
-			// 只对需要同步的文件执行同步
-			if (!this.syncManager.markdownParser.needsSync(parsedMarkdown.frontMatter)) {
+			if (!await this.syncManager.prepareLocalFileForSync(filePath)) {
 				console.log(`File ${filePath} doesn't need sync, skipping...`);
-				return;
+				return true;
 			}
 
 			this.updateStatusBar('Syncing...');
@@ -181,9 +277,11 @@ export default class WolaiSyncPlugin extends Plugin {
 				this.updateStatusBar('Sync Failed');
 				console.error(`Failed to sync: ${filePath}`);
 			}
+			return success;
 		} catch (error) {
 			console.error(`Error syncing file ${filePath}:`, error);
 			this.updateStatusBar('Sync Error');
+			return false;
 		}
 	}
 
@@ -195,7 +293,8 @@ export default class WolaiSyncPlugin extends Plugin {
 			const result = await this.syncManager.fullSync();
 			const totalSynced = result.obsidianToWolai + result.wolaiToObsidian;
 
-			this.updateStatusBar('Synced');
+			this.updateStatusBar(result.status === 'failed' ? 'Sync Failed' :
+				result.status === 'busy' ? 'Sync Busy' : result.status === 'cancelled' ? 'Sync Cancelled' : 'Synced');
 
 			if (result.status === 'cancelled') {
 				new Notice('手动同步已取消');
@@ -238,10 +337,12 @@ export default class WolaiSyncPlugin extends Plugin {
 					console.log('Starting scheduled sync...');
 					this.updateStatusBar('Auto Sync...');
 
-					await this.syncManager.scheduledSync();
+					const result = await this.syncManager.scheduledSync();
+					if (result.status === 'completed' || result.status === 'no_changes') await this.saveData(this.settings);
 
-					this.updateStatusBar('Synced');
-					console.log('Scheduled sync completed');
+					this.updateStatusBar(result.status === 'failed' ? 'Sync Failed' :
+						result.status === 'busy' ? 'Sync Busy' : result.status === 'cancelled' ? 'Sync Cancelled' : 'Synced');
+					console.log(`Scheduled sync finished with status: ${result.status}`);
 				} catch (error) {
 					console.error('Scheduled sync failed:', error);
 					this.updateStatusBar('Sync Failed');
@@ -291,7 +392,9 @@ export default class WolaiSyncPlugin extends Plugin {
 			this.syncIntervalId = window.setInterval(async () => {
 				try {
 					console.log('Executing scheduled sync...');
-					await this.syncManager.scheduledSync();
+					const result = await this.syncManager.scheduledSync();
+					if (result.status === 'completed' || result.status === 'no_changes') await this.saveData(this.settings);
+					this.updateStatusBar(result.status === 'completed' || result.status === 'no_changes' ? 'Synced' : `Sync ${result.status}`);
 				} catch (error) {
 					console.error('Scheduled sync failed:', error);
 				}

@@ -1,5 +1,5 @@
 import { Vault, TFile, Notice, TFolder, normalizePath, requestUrl } from 'obsidian';
-import { WolaiAPI, WolaiDatabaseRowData, APICallStats } from './WolaiAPI';
+import { WolaiAPI, WolaiDatabaseRowData, APICallStats, WolaiBlockMetadata } from './WolaiAPI';
 import { MarkdownParser } from './MarkdownParser';
 import { WolaiSyncSettings, SyncRecord, SyncStatus } from './types';
 import matter from 'gray-matter';
@@ -19,6 +19,8 @@ interface WolaiPageSyncState {
     remoteVersion: number;
     remoteEditedAt: number;
     converterVersion?: number;
+    localHash?: string;
+    localDirty?: boolean;
     children: Array<{ pageId: string; title: string; relativeDir: string }>;
     images: Record<string, { version: number; editedAt: number; path: string }>;
 }
@@ -45,6 +47,7 @@ export class SyncManager {
     private metadataRequestWaiters: Array<() => void> = [];
     private readonly generatedManifestPath: string;
     private readonly incrementalStatePath: string;
+    private readonly incrementalJournalPath: string;
     private readonly resumeStatePath: string;
     private readonly syncLogPath: string;
     private readonly maxLogSize = 2 * 1024 * 1024;
@@ -66,7 +69,13 @@ export class SyncManager {
     public markdownParser: MarkdownParser;
     private settings: WolaiSyncSettings;
     private syncRecords: Map<string, SyncRecord> = new Map();
+    private syncRecordsReady: Promise<void>;
     private readonly dataFilePath: string;
+    private resumePagesSinceWrite = 0;
+    private readonly checkpointBatchSize = 10;
+    private internallyModifiedFiles = new Map<string, { expiresAt: number; hash: string }>();
+    private outboundUpdatedPageIds = new Set<string>();
+    private generatedManifestCache: Record<string, { size: number; mtime: number }> | null = null;
     private syncingFiles: Set<string> = new Set(); // 正在同步的文件集合
 
     constructor(
@@ -79,6 +88,7 @@ export class SyncManager {
         const runtimeDirectory = normalizePath(pluginDirectory);
         this.generatedManifestPath = normalizePath(`${runtimeDirectory}/wolai-generated-files.json`);
         this.incrementalStatePath = normalizePath(`${runtimeDirectory}/wolai-incremental-state.json`);
+        this.incrementalJournalPath = normalizePath(`${runtimeDirectory}/wolai-incremental-journal.jsonl`);
         this.resumeStatePath = normalizePath(`${runtimeDirectory}/wolai-resume-state.json`);
         this.syncLogPath = normalizePath(`${runtimeDirectory}/sync.log`);
         this.apiQuotaPath = normalizePath(`${runtimeDirectory}/wolai-api-quota.json`);
@@ -88,7 +98,7 @@ export class SyncManager {
         void this.loadApiQuota();
 
         // 加载同步记录
-        this.loadSyncRecords();
+        this.syncRecordsReady = this.loadSyncRecords();
     }
 
     addProgressListener(listener: (percent: number, message: string) => void): () => void {
@@ -324,9 +334,20 @@ export class SyncManager {
 
     private async loadIncrementalState(): Promise<WolaiIncrementalState> {
         try {
-            if (await this.vault.adapter.exists(this.incrementalStatePath)) {
-                return JSON.parse(await this.vault.adapter.read(this.incrementalStatePath));
+            const state = await this.readRuntimeJson<WolaiIncrementalState>(this.incrementalStatePath, {});
+            if (await this.vault.adapter.exists(this.incrementalJournalPath)) {
+                const lines = (await this.vault.adapter.read(this.incrementalJournalPath)).split('\n').filter(Boolean);
+                for (const line of lines) {
+                    try {
+                        const entry = JSON.parse(line) as { pageId?: string; state?: WolaiPageSyncState };
+                        if (entry.pageId && entry.state) state[entry.pageId] = entry.state;
+                    } catch {
+                        // A crash may leave one partial final line. Earlier
+                        // complete journal entries remain valid and recoverable.
+                    }
+                }
             }
+            return state;
         } catch (error) {
             console.error('Failed to read Wolai incremental state:', error);
         }
@@ -334,13 +355,14 @@ export class SyncManager {
     }
 
     private async saveIncrementalState(state: WolaiIncrementalState): Promise<void> {
-        await this.vault.adapter.write(this.incrementalStatePath, JSON.stringify(state, null, 2));
+        await this.writeRuntimeJsonAtomic(this.incrementalStatePath, state);
     }
 
     private async loadResumeState(): Promise<WolaiResumeState | null> {
         try {
             if (!await this.vault.adapter.exists(this.resumeStatePath)) return null;
-            const state = JSON.parse(await this.vault.adapter.read(this.resumeStatePath)) as WolaiResumeState;
+            const state = await this.readRuntimeJson<WolaiResumeState | null>(this.resumeStatePath, null);
+            if (!state) return null;
             if (!state.startedAt || Date.now() - state.startedAt > 24 * 60 * 60 * 1000) return null;
             return state;
         } catch (error) {
@@ -349,13 +371,41 @@ export class SyncManager {
         }
     }
 
-    private async saveResumeState(state: WolaiResumeState): Promise<void> {
-        await this.vault.adapter.write(this.resumeStatePath, JSON.stringify(state, null, 2));
+    private async saveResumeState(state: WolaiResumeState, force = false): Promise<void> {
+        this.resumePagesSinceWrite++;
+        if (!force && this.resumePagesSinceWrite < this.checkpointBatchSize) return;
+        await this.writeRuntimeJsonAtomic(this.resumeStatePath, state);
+        this.resumePagesSinceWrite = 0;
     }
 
     private async clearResumeState(): Promise<void> {
         if (await this.vault.adapter.exists(this.resumeStatePath)) {
             await this.vault.adapter.remove(this.resumeStatePath);
+        }
+    }
+
+    private async readRuntimeJson<T>(path: string, fallback: T): Promise<T> {
+        const backupPath = `${path}.bak`;
+        const source = await this.vault.adapter.exists(path) ? path
+            : await this.vault.adapter.exists(backupPath) ? backupPath : '';
+        if (!source) return fallback;
+        return JSON.parse(await this.vault.adapter.read(source)) as T;
+    }
+
+    private async writeRuntimeJsonAtomic(path: string, value: unknown): Promise<void> {
+        const temporaryPath = `${path}.tmp`;
+        const backupPath = `${path}.bak`;
+        await this.vault.adapter.write(temporaryPath, JSON.stringify(value, null, 2));
+        if (await this.vault.adapter.exists(backupPath)) await this.vault.adapter.remove(backupPath);
+        if (await this.vault.adapter.exists(path)) await this.vault.adapter.rename(path, backupPath);
+        try {
+            await this.vault.adapter.rename(temporaryPath, path);
+            if (await this.vault.adapter.exists(backupPath)) await this.vault.adapter.remove(backupPath);
+        } catch (error) {
+            if (!await this.vault.adapter.exists(path) && await this.vault.adapter.exists(backupPath)) {
+                await this.vault.adapter.rename(backupPath, path);
+            }
+            throw error;
         }
     }
 
@@ -365,11 +415,19 @@ export class SyncManager {
      * can reuse these entries; a fully successful run later replaces this merged
      * checkpoint with the authoritative nextState.
      */
-    private async saveIncrementalCheckpoint(
-        previousState: WolaiIncrementalState,
-        nextState: WolaiIncrementalState
-    ): Promise<void> {
-        await this.saveIncrementalState({ ...previousState, ...nextState });
+    private async appendIncrementalCheckpoint(pageId: string, state: WolaiPageSyncState): Promise<void> {
+        const line = `${JSON.stringify({ pageId, state })}\n`;
+        if (await this.vault.adapter.exists(this.incrementalJournalPath)) {
+            await this.vault.adapter.append(this.incrementalJournalPath, line);
+        } else {
+            await this.vault.adapter.write(this.incrementalJournalPath, line);
+        }
+    }
+
+    private async clearIncrementalJournal(): Promise<void> {
+        if (await this.vault.adapter.exists(this.incrementalJournalPath)) {
+            await this.vault.adapter.remove(this.incrementalJournalPath);
+        }
     }
 
     private createPageFingerprint(blocks: any[]): string {
@@ -383,6 +441,96 @@ export class SyncManager {
             parentBlockId: block.parentBlockId
         }));
         return this.markdownParser.createHash(JSON.stringify(snapshot));
+    }
+
+    private markInternalWrite(filePath: string, content: string): void {
+        this.internallyModifiedFiles.set(filePath, {
+            expiresAt: Date.now() + 5000,
+            hash: this.markdownParser.createHash(content)
+        });
+    }
+
+    private async loadGeneratedManifestCache(): Promise<Record<string, { size: number; mtime: number }>> {
+        if (!this.generatedManifestCache) {
+            this.generatedManifestCache = await this.readRuntimeJson(
+                this.generatedManifestPath, {} as Record<string, { size: number; mtime: number }>);
+        }
+        return this.generatedManifestCache;
+    }
+
+    private async getGeneratedBaselineHash(filePath: string): Promise<string | undefined> {
+        const manifest = await this.loadGeneratedManifestCache();
+        const file = this.vault.getAbstractFileByPath(filePath);
+        const entry = manifest[filePath];
+        if (!(file instanceof TFile) || !entry || file.stat.size !== entry.size || file.stat.mtime !== entry.mtime) {
+            return undefined;
+        }
+        return this.markdownParser.createHash(await this.vault.read(file));
+    }
+
+    private async legacyGeneratedFileWasModified(filePath: string): Promise<boolean> {
+        const manifest = await this.loadGeneratedManifestCache();
+        const file = this.vault.getAbstractFileByPath(filePath);
+        const entry = manifest[filePath];
+        return file instanceof TFile && Boolean(entry) &&
+            (file.stat.size !== entry.size || file.stat.mtime !== entry.mtime);
+    }
+
+    private isExpectedInternalWrite(filePath: string, content: string): boolean {
+        const expected = this.internallyModifiedFiles.get(filePath);
+        if (!expected || expected.expiresAt <= Date.now()) {
+            this.internallyModifiedFiles.delete(filePath);
+            return false;
+        }
+        if (expected.hash === this.markdownParser.createHash(content)) return true;
+        // A user edit that follows an internal write must not be hidden by the
+        // short event-suppression window.
+        this.internallyModifiedFiles.delete(filePath);
+        return false;
+    }
+
+    async prepareLocalFileForSync(filePath: string): Promise<boolean> {
+        await this.syncRecordsReady;
+        const file = this.vault.getAbstractFileByPath(filePath);
+        if (!(file instanceof TFile)) return false;
+        const content = await this.vault.read(file);
+        if (this.isExpectedInternalWrite(filePath, content)) return false;
+        const parsed = this.markdownParser.parseMarkdown(content);
+        if (this.markdownParser.needsSync(parsed.frontMatter)) return true;
+        const pageId = String(parsed.frontMatter.wolai_id || '');
+        if (!pageId || parsed.frontMatter.sync_status !== 'Synced') return false;
+        const state = await this.loadIncrementalState();
+        const baseline = state[pageId]?.localHash || this.syncRecords.get(filePath)?.hash ||
+            await this.getGeneratedBaselineHash(filePath);
+        const contentChanged = baseline
+            ? baseline !== this.markdownParser.createHash(content)
+            : Boolean(state[pageId] && await this.legacyGeneratedFileWasModified(filePath));
+        if (!contentChanged) return false;
+        const updated = this.markdownParser.updateSyncStatus(content, 'Modified', pageId);
+        this.markInternalWrite(filePath, updated);
+        await this.vault.modify(file, updated);
+        if (state[pageId]) {
+            state[pageId] = { ...state[pageId], localDirty: true };
+            await this.appendIncrementalCheckpoint(pageId, state[pageId]);
+        }
+        void this.writeSyncLog('INFO', `检测到 Obsidian 本地修改，已加入上传队列：${filePath}`);
+        return true;
+    }
+
+    private async writeConflictCopy(filePath: string, pageId: string, remoteContent: string): Promise<string> {
+        const conflictDir = normalizePath(`${this.settings.obsidianFolder}/_conflicts`);
+        await this.ensureFolder(conflictDir);
+        const baseName = filePath.split('/').pop()?.replace(/\.md$/i, '') || pageId;
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const conflictPath = normalizePath(`${conflictDir}/${baseName}-wolai-${stamp}.md`);
+        const content = matter.stringify(remoteContent, {
+            sync_status: 'Conflict',
+            wolai_id: pageId,
+            conflict_source: 'Wolai',
+            conflict_created_at: new Date().toISOString()
+        });
+        await this.vault.create(conflictPath, content);
+        return conflictPath;
     }
 
     private registerPageProgress(context: PageProgressContext | undefined, pageId: string): void {
@@ -465,16 +613,11 @@ export class SyncManager {
 
     private async loadSyncRecords(): Promise<void> {
         try {
-            // 检查数据文件是否存在
-            const dataFile = this.vault.getAbstractFileByPath(this.dataFilePath);
-            if (!dataFile || !(dataFile instanceof TFile)) {
+            if (!await this.vault.adapter.exists(this.dataFilePath)) {
                 console.log('Sync records file not found, starting with empty records');
                 return;
             }
-
-            // 读取并解析同步记录
-            const content = await this.vault.read(dataFile);
-            const recordsData = JSON.parse(content);
+            const recordsData = await this.readRuntimeJson<Record<string, SyncRecord>>(this.dataFilePath, {});
 
             // 将数据转换为Map
             this.syncRecords = new Map();
@@ -497,27 +640,18 @@ export class SyncManager {
                 recordsData[filePath] = record;
             }
 
-            // 序列化为JSON
-            const content = JSON.stringify(recordsData, null, 2);
-
-            // 检查数据文件是否存在
-            const dataFile = this.vault.getAbstractFileByPath(this.dataFilePath);
-            if (dataFile && dataFile instanceof TFile) {
-                // 更新现有文件
-                await this.vault.modify(dataFile, content);
-            } else {
-                // 创建新文件
-                await this.vault.create(this.dataFilePath, content);
-            }
+            await this.writeRuntimeJsonAtomic(this.dataFilePath, recordsData);
 
             console.log(`Saved ${this.syncRecords.size} sync records`);
         } catch (error) {
             console.error('Error saving sync records:', error);
+            throw error;
         }
     }
 
     private async syncObsidianToWolai(filePath: string): Promise<boolean> {
         try {
+            await this.syncRecordsReady;
             // 检查文件是否正在同步中
             if (this.syncingFiles.has(filePath)) {
                 console.log(`File ${filePath} is already being synced, skipping...`);
@@ -564,11 +698,74 @@ export class SyncManager {
 
             this.debugLog('Row data to be inserted:', rowData);
 
-            // 插入数据库行并获取页面ID
-            const pageId = await this.wolaiAPI.insertDatabaseRowAndGetPageId(
-                this.settings.wolaiDatabaseId,
-                rowData
-            );
+            const linkedPageId = String(parsedMarkdown.frontMatter.wolai_id || '');
+            let pageId = linkedPageId;
+            const incrementalState = linkedPageId ? await this.loadIncrementalState() : {};
+            const previousPage = linkedPageId ? incrementalState[linkedPageId] : undefined;
+            const previousRecord = this.syncRecords.get(filePath);
+            const pendingLocalHash = this.markdownParser.createHash(content);
+
+            if (linkedPageId) {
+                const metadataBefore: WolaiBlockMetadata = await this.getPageMetadataLimited(linkedPageId);
+                const baselineVersion = previousPage?.remoteVersion ?? previousRecord?.remoteVersion;
+                const baselineEditedAt = previousPage?.remoteEditedAt ?? previousRecord?.remoteEditedAt;
+                if (baselineVersion === undefined || baselineEditedAt === undefined) {
+                    const message = `缺少远端基线，已阻止覆盖 Wolai 页面：${filePath}`;
+                    void this.writeSyncLog('ERROR', message);
+                    new Notice(message);
+                    return false;
+                }
+                let remoteChanged = baselineVersion !== Number(metadataBefore.version || 0) ||
+                    baselineEditedAt !== Number(metadataBefore.edited_at || 0);
+                let remoteConflictMarkdown = '';
+                // Parent metadata does not reliably reflect every descendant
+                // block edit. A local upload is rare enough to verify the full
+                // remote fingerprint before allowing destructive changes.
+                if (previousPage) {
+                    const remoteBlocks = await this.wolaiAPI.getAllPageBlocks(linkedPageId);
+                    const remoteChildIds = new Set(remoteBlocks.filter(block => block.type === 'page').map(block => block.id));
+                    const remoteParentBlocks = remoteBlocks.filter(block =>
+                        !block.parentBlockId || !remoteChildIds.has(block.parentBlockId));
+                    remoteConflictMarkdown = this.markdownParser.convertWolaiPageToMarkdown(remoteParentBlocks, title);
+                    remoteChanged = remoteChanged ||
+                        this.createPageFingerprint(remoteParentBlocks) !== previousPage.fingerprint;
+                }
+                const recoveringInterruptedUpdate = previousRecord?.updateInProgress === true &&
+                    previousRecord.pendingHash === pendingLocalHash &&
+                    Date.now() - Number(previousRecord.updateStartedAt || 0) < 24 * 60 * 60 * 1000;
+                if (remoteChanged && !recoveringInterruptedUpdate) {
+                    if (remoteConflictMarkdown) {
+                        await this.writeConflictCopy(filePath, linkedPageId, remoteConflictMarkdown);
+                    }
+                    const conflictContent = this.markdownParser.updateSyncStatus(content, 'Conflict', linkedPageId);
+                    this.markInternalWrite(filePath, conflictContent);
+                    await this.vault.modify(file, conflictContent);
+                    const message = `检测到双向修改冲突，未覆盖 Wolai：${filePath}`;
+                    void this.writeSyncLog('ERROR', message);
+                    new Notice(message);
+                    return false;
+                }
+                this.syncRecords.set(filePath, {
+                    filePath,
+                    lastModified: file.stat.mtime,
+                    wolaiRowId: linkedPageId,
+                    synced: false,
+                    hash: previousRecord?.hash || previousPage?.localHash || '',
+                    remoteVersion: baselineVersion,
+                    remoteEditedAt: baselineEditedAt,
+                    updateInProgress: true,
+                    pendingHash: pendingLocalHash,
+                    updateStartedAt: Date.now()
+                });
+                await this.saveSyncRecords();
+                await this.wolaiAPI.replacePageContent(linkedPageId, parsedMarkdown.blocks);
+                this.outboundUpdatedPageIds.add(linkedPageId);
+            } else {
+                pageId = await this.wolaiAPI.insertDatabaseRowAndGetPageId(
+                    this.settings.wolaiDatabaseId,
+                    rowData
+                ) || '';
+            }
 
             if (!pageId) {
                 console.error(`Failed to insert database row for file: ${filePath}`);
@@ -577,8 +774,9 @@ export class SyncManager {
 
             console.log(`Database row inserted successfully, got page ID: ${pageId}`);
 
-            // 创建块内容
-            if (parsedMarkdown.blocks.length > 0) {
+            // New database rows have no content yet. Existing linked pages were
+            // updated in place above and must not receive a second copy.
+            if (!linkedPageId && parsedMarkdown.blocks.length > 0) {
                 console.log(`Creating ${parsedMarkdown.blocks.length} blocks for page ${pageId}`);
                 const blocksResult = await this.wolaiAPI.createBlocks(pageId, parsedMarkdown.blocks);
                 if (!blocksResult) {
@@ -592,22 +790,57 @@ export class SyncManager {
                 console.log('No blocks to create (empty content)');
             }
 
-            // 更新文件的同步状态
-            const updatedContent = this.markdownParser.updateSyncStatus(content, 'Synced', pageId);
+            const metadataAfter = await this.getPageMetadataLimited(pageId);
+            let fingerprintAfter: string | undefined;
+            if (previousPage) {
+                const remoteBlocksAfter = await this.wolaiAPI.getAllPageBlocks(pageId);
+                const remoteChildIds = new Set(remoteBlocksAfter.filter(block => block.type === 'page').map(block => block.id));
+                fingerprintAfter = this.createPageFingerprint(remoteBlocksAfter.filter(block =>
+                    !block.parentBlockId || !remoteChildIds.has(block.parentBlockId)));
+            }
+
+            // A user may continue typing while the remote update is in flight.
+            // Never replace those newer edits just to update Front Matter.
+            const latestContent = await this.vault.read(file);
+            const changedDuringUpload = this.markdownParser.createHash(latestContent) !== pendingLocalHash;
+            const updatedContent = this.markdownParser.updateSyncStatus(
+                latestContent, changedDuringUpload ? 'Modified' : 'Synced', pageId);
+            this.markInternalWrite(filePath, updatedContent);
             await this.vault.modify(file, updatedContent);
+
+            const updatedFile = this.vault.getAbstractFileByPath(filePath);
+            const updatedHash = this.markdownParser.createHash(updatedContent);
 
             // 更新同步记录
             const syncRecord: SyncRecord = {
                 filePath: filePath,
-                lastModified: file.stat.mtime,
+                lastModified: updatedFile instanceof TFile ? updatedFile.stat.mtime : file.stat.mtime,
                 wolaiRowId: pageId,
-                synced: true,
-                hash: this.markdownParser.createHash(updatedContent)
+                synced: !changedDuringUpload,
+                hash: changedDuringUpload ? previousRecord?.hash || previousPage?.localHash || '' : updatedHash,
+                remoteVersion: Number(metadataAfter.version || 0),
+                remoteEditedAt: Number(metadataAfter.edited_at || 0)
             };
 
             this.syncRecords.set(filePath, syncRecord);
             await this.saveSyncRecords();
+            if (previousPage) {
+                incrementalState[pageId] = {
+                    ...previousPage,
+                    fingerprint: fingerprintAfter || previousPage.fingerprint,
+                    localHash: changedDuringUpload ? previousPage.localHash : updatedHash,
+                    localDirty: changedDuringUpload,
+                    remoteVersion: Number(metadataAfter.version || 0),
+                    remoteEditedAt: Number(metadataAfter.edited_at || 0)
+                };
+                await this.saveIncrementalState(incrementalState);
+                await this.clearIncrementalJournal();
+            }
 
+            if (changedDuringUpload) {
+                void this.writeSyncLog('WARN', `上传期间文件再次变化，已保留为 Modified 并等待下一轮：${filePath}`);
+                return false;
+            }
             console.log(`Successfully synced Obsidian→Wolai: ${filePath}`);
             return true;
 
@@ -638,6 +871,7 @@ export class SyncManager {
             console.log(`Found ${waitingRows.length} rows waiting for sync from Wolai`);
 
             let successCount = 0;
+            let databaseFailures = 0;
             for (let index = 0; index < waitingRows.length; index++) {
                 const row = waitingRows[index];
                 this.reportProgress(50 + (index / Math.max(1, waitingRows.length)) * 20,
@@ -655,12 +889,17 @@ export class SyncManager {
                 const success = await this.createOrUpdateObsidianFile(row);
                 if (success) {
                     successCount++;
+                } else {
+                    databaseFailures++;
                 }
             }
 
             // Database scanning and configured-page recursion deliberately run
             // sequentially so they cannot create two independent request bursts.
             successCount += await this.syncConfiguredWolaiPages(mode);
+            if (databaseFailures > 0) {
+                throw new Error(`${databaseFailures} Wolai database page(s) failed to synchronize`);
+            }
             return successCount;
 
         } catch (error) {
@@ -689,6 +928,7 @@ export class SyncManager {
     }
 
     private async syncConfiguredWolaiPages(mode: SyncMode): Promise<number> {
+        this.resumePagesSinceWrite = 0;
         const pages = this.parseConfiguredWolaiPages();
         let successCount = 0;
         const generatedFiles = new Set<string>();
@@ -700,7 +940,7 @@ export class SyncManager {
             ? savedResume || { startedAt: Date.now(), verifiedPageIds: {} }
             : undefined;
         if (resumeState) {
-            await this.saveResumeState(resumeState);
+            await this.saveResumeState(resumeState, true);
             const verifiedCount = Object.keys(resumeState.verifiedPageIds).length;
             if (verifiedCount > 0) {
                 this.reportProgress(48, `正在恢复上次中断的增量同步：已核验 ${verifiedCount} 个页面`);
@@ -740,11 +980,12 @@ export class SyncManager {
                 if (!nextState[pageId]) changedPages.add(pageId);
             }
         }
-        if (pages.length > 0 && successCount === pages.length && this.settings.safeCleanup !== false) {
+        if (mode === 'full' && pages.length > 0 && successCount === pages.length && this.settings.safeCleanup !== false) {
             await this.safelyCleanupGeneratedFiles(generatedFiles);
         }
         if (pages.length > 0 && successCount === pages.length) {
             await this.saveIncrementalState(nextState);
+            await this.clearIncrementalJournal();
             await this.clearResumeState();
         }
 
@@ -806,7 +1047,8 @@ export class SyncManager {
                 next[path] = { size: file.stat.size, mtime: file.stat.mtime };
             }
         }
-        await this.vault.adapter.write(this.generatedManifestPath, JSON.stringify(next, null, 2));
+        await this.writeRuntimeJsonAtomic(this.generatedManifestPath, next);
+        this.generatedManifestCache = next;
     }
 
     private async ensureFolder(folderPath: string): Promise<void> {
@@ -912,6 +1154,7 @@ export class SyncManager {
                 [syncFolder, relativeDir, filePath].filter(Boolean).join('/')
             );
             const previousPage = previousState[row.page_id];
+            const previousRecord = this.syncRecords.get(fullFilePath);
             const localStateIsUsable = Boolean(previousPage &&
                 previousPage.converterVersion === this.converterVersion &&
                 previousPage.filePath === fullFilePath &&
@@ -925,9 +1168,14 @@ export class SyncManager {
             // an ordinary new run still checks Wolai for remote changes.
             const resumablePage = localStateIsUsable ? previousPage : undefined;
             if (mode === 'incremental' && resumeState?.verifiedPageIds[row.page_id] && resumablePage) {
+                const resumedHash = resumablePage.localHash || await this.getGeneratedBaselineHash(fullFilePath);
+                const resumedState = resumedHash ? {
+                    ...resumablePage,
+                    localHash: resumedHash
+                } : resumablePage;
                 generatedFiles?.add(resumablePage.filePath);
                 for (const image of Object.values(resumablePage.images || {})) generatedFiles?.add(image.path);
-                nextState[row.page_id] = resumablePage;
+                nextState[row.page_id] = resumedState;
                 for (const child of resumablePage.children) this.registerPageProgress(progressContext, child.pageId);
                 this.completePageProgress(progressContext);
                 for (const child of resumablePage.children) {
@@ -948,11 +1196,16 @@ export class SyncManager {
                 previousPage.remoteEditedAt === Number(metadata.edited_at || 0) &&
                 previousPage.filePath === fullFilePath;
             if (canFastSkip) {
+                const fastHash = previousPage.localHash || await this.getGeneratedBaselineHash(fullFilePath);
+                const fastState = fastHash ? {
+                    ...previousPage,
+                    localHash: fastHash
+                } : previousPage;
                 generatedFiles?.add(previousPage.filePath);
                 for (const image of Object.values(previousPage.images || {})) {
                     if (this.vault.getAbstractFileByPath(image.path) instanceof TFile) generatedFiles?.add(image.path);
                 }
-                nextState[row.page_id] = previousPage;
+                nextState[row.page_id] = fastState;
                 for (const child of previousPage.children) {
                     this.registerPageProgress(progressContext, child.pageId);
                 }
@@ -999,9 +1252,17 @@ export class SyncManager {
                 !block.parentBlockId || !childPageIds.has(block.parentBlockId)
             );
             const fingerprint = this.createPageFingerprint(parentPageBlocks);
-            const pageChanged = mode === 'full' || !previousPage || previousPage.fingerprint !== fingerprint ||
-                previousPage.converterVersion !== this.converterVersion ||
-                previousPage.filePath !== fullFilePath || !(this.vault.getAbstractFileByPath(fullFilePath) instanceof TFile);
+            const baselineVersion = previousPage?.remoteVersion ?? previousRecord?.remoteVersion;
+            const baselineEditedAt = previousPage?.remoteEditedAt ?? previousRecord?.remoteEditedAt;
+            const hasRemoteBaseline = baselineVersion !== undefined && baselineEditedAt !== undefined;
+            const actualRemoteChanged = !this.outboundUpdatedPageIds.has(row.page_id) &&
+                (!hasRemoteBaseline ||
+                    (previousPage ? previousPage.fingerprint !== fingerprint : false) ||
+                    baselineVersion !== Number(metadata.version || 0) ||
+                    baselineEditedAt !== Number(metadata.edited_at || 0));
+            const pageChanged = mode === 'full' || actualRemoteChanged ||
+                previousPage?.converterVersion !== this.converterVersion ||
+                previousPage?.filePath !== fullFilePath || !(this.vault.getAbstractFileByPath(fullFilePath) instanceof TFile);
             const imageResult = await this.downloadPageImages(
                 parentPageBlocks as any[], pageName, relativeDir, generatedFiles,
                 mode, previousPage?.images || {}
@@ -1019,12 +1280,43 @@ export class SyncManager {
                 console.log(`No blocks found for page ${row.page_id}, using placeholder content`);
             }
 
+            let writtenLocalHash = previousPage?.localHash;
+            let resultingLocalDirty = Boolean(previousPage?.localDirty);
             if (pageChanged) {
                 const fullContent = matter.stringify(markdownContent, frontMatter);
                 const existingFile = this.vault.getAbstractFileByPath(fullFilePath);
-                if (existingFile && existingFile instanceof TFile) {
+                const existingContent = existingFile instanceof TFile ? await this.vault.read(existingFile) : '';
+                const currentLocalHash = existingContent ? this.markdownParser.createHash(existingContent) : '';
+                const legacyBaselineHash = (previousPage || previousRecord) &&
+                    !previousPage?.localHash && !previousRecord?.hash
+                    ? await this.getGeneratedBaselineHash(fullFilePath) : undefined;
+                const effectiveBaselineHash = previousPage?.localHash || previousRecord?.hash || legacyBaselineHash;
+                const existingStatus = existingContent
+                    ? this.markdownParser.parseMarkdown(existingContent).frontMatter.sync_status : undefined;
+                const explicitlyDirty = existingStatus === 'Modified' || existingStatus === 'Conflict';
+                const unknownLegacyBaseline = Boolean(existingFile instanceof TFile &&
+                    (previousPage || previousRecord) && !effectiveBaselineHash);
+                const localModified = Boolean(existingFile instanceof TFile &&
+                    (explicitlyDirty || previousPage?.localDirty || unknownLegacyBaseline ||
+                        (!this.outboundUpdatedPageIds.has(row.page_id) &&
+                            effectiveBaselineHash && currentLocalHash !== effectiveBaselineHash)));
+                if (localModified && actualRemoteChanged) {
+                    const conflictPath = await this.writeConflictCopy(fullFilePath, row.page_id, markdownContent);
+                    throw new Error(`SYNC_CONFLICT: local and Wolai changed; remote copy saved to ${conflictPath}`);
+                }
+                if (localModified) {
+                    void this.writeSyncLog('WARN', `保留本地修改，未用完整同步覆盖：${fullFilePath}`);
+                    const markedContent = this.markdownParser.updateSyncStatus(existingContent, 'Modified', row.page_id);
+                    this.markInternalWrite(fullFilePath, markedContent);
+                    await this.vault.modify(existingFile as TFile, markedContent);
+                    writtenLocalHash = effectiveBaselineHash || currentLocalHash;
+                    resultingLocalDirty = true;
+                } else if (existingFile && existingFile instanceof TFile) {
                 // 更新现有文件
+                    this.markInternalWrite(fullFilePath, fullContent);
                     await this.vault.modify(existingFile, fullContent);
+                    writtenLocalHash = this.markdownParser.createHash(fullContent);
+                    resultingLocalDirty = false;
                     console.log(`Updated changed file: ${fullFilePath}`);
                 } else {
                 // 创建新文件（确保目录存在）
@@ -1041,6 +1333,8 @@ export class SyncManager {
 
                     try {
                         await this.vault.create(fullFilePath, fullContent);
+                        writtenLocalHash = this.markdownParser.createHash(fullContent);
+                        resultingLocalDirty = false;
                         console.log(`Created new file: ${fullFilePath}`);
                     } catch (error) {
                         console.error(`Failed to create file ${fullFilePath}:`, error);
@@ -1063,6 +1357,42 @@ export class SyncManager {
                 this.registerPageProgress(progressContext, childPage.id);
             }
 
+            nextState[row.page_id] = {
+                fingerprint,
+                filePath: fullFilePath,
+                title: pageName,
+                relativeDir,
+                remoteVersion: Number(metadata.version || 0),
+                remoteEditedAt: Number(metadata.edited_at || 0),
+                converterVersion: this.converterVersion,
+                localHash: writtenLocalHash,
+                localDirty: resultingLocalDirty,
+                children: childDescriptors,
+                images: imageResult.images
+            };
+
+            if (!generatedFiles) {
+                const syncedFile = this.vault.getAbstractFileByPath(fullFilePath);
+                this.syncRecords.set(fullFilePath, {
+                    filePath: fullFilePath,
+                    lastModified: syncedFile instanceof TFile ? syncedFile.stat.mtime : Date.now(),
+                    wolaiRowId: row.page_id,
+                    synced: !resultingLocalDirty,
+                    hash: writtenLocalHash || '',
+                    remoteVersion: Number(metadata.version || 0),
+                    remoteEditedAt: Number(metadata.edited_at || 0)
+                });
+                await this.saveSyncRecords();
+            }
+
+            // Save this page before descending. A deep child failure can then
+            // resume without downloading its already-completed ancestors.
+            await this.appendIncrementalCheckpoint(row.page_id, nextState[row.page_id]);
+            if (resumeState) {
+                resumeState.verifiedPageIds[row.page_id] = Date.now();
+                await this.saveResumeState(resumeState, childDescriptors.length > 0);
+            }
+
             this.completePageProgress(progressContext);
             for (const child of childDescriptors) {
                 const childSuccess = await this.createOrUpdateObsidianFile({
@@ -1073,34 +1403,13 @@ export class SyncManager {
                 if (!childSuccess) throw new Error(`Failed to sync child page ${child.pageId} of ${row.page_id}`);
             }
 
-            nextState[row.page_id] = {
-                fingerprint,
-                filePath: fullFilePath,
-                title: pageName,
-                relativeDir,
-                remoteVersion: Number(metadata.version || 0),
-                remoteEditedAt: Number(metadata.edited_at || 0),
-                converterVersion: this.converterVersion,
-                children: childDescriptors,
-                images: imageResult.images
-            };
-
-            // A page is checkpointed only after its Markdown, images and all
-            // descendants completed.  Preserve older entries until the whole
-            // configured tree succeeds so an interrupted run cannot imply that
-            // unseen pages were deleted.
-            await this.saveIncrementalCheckpoint(previousState, nextState);
-            if (resumeState) {
-                resumeState.verifiedPageIds[row.page_id] = Date.now();
-                await this.saveResumeState(resumeState);
-            }
-
             void this.writeSyncLog('INFO',
                 `页面处理完成：${fullFilePath}；页面=${pageChanged ? '已更新' : '未变更'}；图片=${Object.keys(imageResult.images).length}；子页面=${childDescriptors.length}`);
 
             return true;
 
         } catch (error) {
+            if (resumeState) await this.saveResumeState(resumeState, true).catch(() => undefined);
             if (this.isCancellationError(error)) throw error;
             console.error('Error creating/updating Obsidian file:', error);
             void this.writeSyncLog('ERROR', `页面同步失败：${row.page_id}；${String(error)}`);
@@ -1126,11 +1435,7 @@ export class SyncManager {
         const filesToSync: string[] = [];
         for (const filePath of obsidianFiles) {
             const file = this.vault.getAbstractFileByPath(filePath);
-            if (file instanceof TFile) {
-                const content = await this.vault.read(file);
-                const parsed = this.markdownParser.parseMarkdown(content);
-                if (this.markdownParser.needsSync(parsed.frontMatter)) filesToSync.push(filePath);
-            }
+            if (file instanceof TFile && await this.prepareLocalFileForSync(filePath)) filesToSync.push(filePath);
         }
 
         let synced = 0;
@@ -1152,6 +1457,7 @@ export class SyncManager {
         }
         this.syncActive = true;
         this.cancelRequested = false;
+        this.outboundUpdatedPageIds.clear();
         try {
             return await operation();
         } catch (error) {
@@ -1165,6 +1471,7 @@ export class SyncManager {
             this.syncPaused = false;
             for (const resolve of this.pauseWaiters.splice(0)) resolve();
             this.cancelWaiters.splice(0);
+            this.outboundUpdatedPageIds.clear();
         }
     }
 
@@ -1175,6 +1482,7 @@ export class SyncManager {
         }
         this.syncActive = true;
         this.cancelRequested = false;
+        this.outboundUpdatedPageIds.clear();
         if (this.syncPaused) this.resumeSync();
         try {
             return await this.executeSync(mode);
@@ -1191,6 +1499,7 @@ export class SyncManager {
             this.syncPaused = false;
             for (const resolve of this.pauseWaiters.splice(0)) resolve();
             this.cancelWaiters.splice(0);
+            this.outboundUpdatedPageIds.clear();
         }
     }
 
@@ -1214,9 +1523,7 @@ export class SyncManager {
         for (const filePath of obsidianFiles) {
             const file = this.vault.getAbstractFileByPath(filePath) as TFile;
             if (file && file instanceof TFile) {
-                const content = await this.vault.read(file);
-                const parsed = this.markdownParser.parseMarkdown(content);
-                if (this.markdownParser.needsSync(parsed.frontMatter)) {
+                if (await this.prepareLocalFileForSync(filePath)) {
                     filesToSyncToWolai.push(filePath);
                 }
             }
@@ -1225,6 +1532,7 @@ export class SyncManager {
         console.log(`Found ${filesToSyncToWolai.length} Obsidian files to sync to Wolai`);
 
         let obsidianToWolaiCount = 0;
+        let obsidianToWolaiFailures = 0;
         for (let index = 0; index < filesToSyncToWolai.length; index++) {
             const filePath = filesToSyncToWolai[index];
             this.reportProgress(10 + (index / Math.max(1, filesToSyncToWolai.length)) * 35,
@@ -1232,6 +1540,8 @@ export class SyncManager {
             const success = await this.syncObsidianToWolai(filePath);
             if (success) {
                 obsidianToWolaiCount++;
+            } else {
+                obsidianToWolaiFailures++;
             }
             // 添加延迟避免API限制
             await new Promise(resolve => setTimeout(resolve, 500));
@@ -1244,15 +1554,20 @@ export class SyncManager {
         const result: SyncResult = {
             obsidianToWolai: obsidianToWolaiCount,
             wolaiToObsidian: wolaiToObsidianCount,
-            status: obsidianToWolaiCount === 0 && wolaiToObsidianCount === 0 ? 'no_changes' : 'completed'
+            status: obsidianToWolaiFailures > 0 ? 'failed' :
+                obsidianToWolaiCount === 0 && wolaiToObsidianCount === 0 ? 'no_changes' : 'completed'
         };
 
-        if (mode === 'incremental' && result.obsidianToWolai === 0 && result.wolaiToObsidian === 0) {
+        if (result.status === 'failed') {
+            new Notice(`同步失败：${obsidianToWolaiFailures} 个 Obsidian 文件未上传，请查看日志`);
+        } else if (mode === 'incremental' && result.obsidianToWolai === 0 && result.wolaiToObsidian === 0) {
             new Notice('没有检测到增量内容，所有页面和图片均为最新状态');
         } else {
             new Notice(`${mode === 'full' ? '完整' : '增量'}同步完成: Obsidian→Wolai ${result.obsidianToWolai}个文件, Wolai→Obsidian ${result.wolaiToObsidian}个文件`);
         }
-        this.reportProgress(100, '同步完成');
+        this.reportProgress(100, result.status === 'failed'
+            ? `同步完成，但有 ${obsidianToWolaiFailures} 个 Obsidian 文件失败`
+            : '同步完成');
 
         return result;
     }
@@ -1285,15 +1600,17 @@ export class SyncManager {
         return files;
     }
 
-    async scheduledSync(): Promise<void> {
+    async scheduledSync(): Promise<SyncResult> {
         console.log('Starting scheduled bidirectional sync...');
 
         const result = await this.incrementalSync();
 
-        // 更新最后同步时间
-        this.settings.lastSyncTime = Date.now();
+        if (result.status === 'completed' || result.status === 'no_changes') {
+            this.settings.lastSyncTime = Date.now();
+        }
 
         console.log(`Scheduled sync completed: ${result.obsidianToWolai + result.wolaiToObsidian} files synced`);
+        return result;
     }
 
     async validateSync(): Promise<boolean> {
@@ -1392,84 +1709,9 @@ export class SyncManager {
 
     private async executeForceSyncObsidianToWolai(filePath: string): Promise<boolean> {
         try {
-            // 强制同步，绕过同步锁和状态检查
             console.log(`Starting FORCE sync Obsidian→Wolai for file: ${filePath}`);
-
-            // 获取文件
-            const file = this.vault.getAbstractFileByPath(filePath) as TFile;
-            if (!file || !(file instanceof TFile)) {
-                console.error(`File not found: ${filePath}`);
-                return false;
-            }
-
-            // 读取文件内容
-            const content = await this.vault.read(file);
-            const parsedMarkdown = this.markdownParser.parseMarkdown(content);
-
-            console.log(`Parsing markdown content, found ${parsedMarkdown.blocks.length} blocks`);
-            this.debugLog('Blocks to be created:', parsedMarkdown.blocks);
-
-            // 解析并准备数据
-            const fileName = file.basename;
-            const title = this.markdownParser.extractTitle(parsedMarkdown.frontMatter, fileName);
-
-            const rowData = {
-                ...parsedMarkdown.frontMatter,
-                '标题': title,
-                '文件名': fileName,
-                '文件路径': filePath,
-                '同步时间': new Date().toISOString(),
-                '同步状态': 'Synced'
-            };
-
-            this.debugLog('Row data to be inserted:', rowData);
-
-            // 插入数据库行并获取页面ID
-            const pageId = await this.wolaiAPI.insertDatabaseRowAndGetPageId(
-                this.settings.wolaiDatabaseId,
-                rowData
-            );
-
-            if (!pageId) {
-                console.error(`Failed to insert database row for file: ${filePath}`);
-                return false;
-            }
-
-            console.log(`Database row inserted successfully, got page ID: ${pageId}`);
-
-            // 创建块内容
-            if (parsedMarkdown.blocks.length > 0) {
-                console.log(`Creating ${parsedMarkdown.blocks.length} blocks for page ${pageId}`);
-                const blocksResult = await this.wolaiAPI.createBlocks(pageId, parsedMarkdown.blocks);
-                if (!blocksResult) {
-                    console.error(`Failed to create blocks for file: ${filePath}`);
-                    new Notice(`文件 ${filePath} 强制同步失败：无法创建块内容`);
-                    return false;
-                } else {
-                    console.log('Blocks created successfully');
-                }
-            } else {
-                console.log('No blocks to create (empty content)');
-            }
-
-            // 更新文件的同步状态
-            const updatedContent = this.markdownParser.updateSyncStatus(content, 'Synced', pageId);
-            await this.vault.modify(file, updatedContent);
-
-            // 更新同步记录
-            const syncRecord: SyncRecord = {
-                filePath: filePath,
-                lastModified: file.stat.mtime,
-                wolaiRowId: pageId,
-                synced: true,
-                hash: this.markdownParser.createHash(updatedContent)
-            };
-
-            this.syncRecords.set(filePath, syncRecord);
-            await this.saveSyncRecords();
-
-            console.log(`Successfully FORCE synced Obsidian→Wolai: ${filePath}`);
-            return true;
+            await this.forceUpdateFileStatus(filePath, 'Modified');
+            return await this.syncObsidianToWolai(filePath);
 
         } catch (error) {
             console.error(`Error force syncing Obsidian→Wolai ${filePath}:`, error);

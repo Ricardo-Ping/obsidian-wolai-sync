@@ -50,6 +50,7 @@ export class WolaiAPI {
     private baseUrl = 'https://openapi.wolai.com/v1';
     private token: string | null = null;
     private tokenExpireTime = 0;
+    private tokenRequest: Promise<string | null> | null = null;
     private requestQueue: Promise<void> = Promise.resolve();
     private lastRequestAt = 0;
     private rateLimitUntil = 0;
@@ -231,8 +232,14 @@ export class WolaiAPI {
             return this.token;
         }
 
-        // 重新获取token
-        return await this.createToken();
+        // Reuse one in-flight token request. Recursive page scans otherwise
+        // create several tokens concurrently at startup and waste API quota.
+        if (!this.tokenRequest) {
+            this.tokenRequest = this.createToken().finally(() => {
+                this.tokenRequest = null;
+            });
+        }
+        return await this.tokenRequest;
     }
 
     async validateConnection(): Promise<boolean> {
@@ -293,10 +300,10 @@ export class WolaiAPI {
         return this.extractPageIdFromUrl(rowUrl);
     }
 
-    async getDatabaseContent(databaseId: string, pageSize = 200, startCursor?: string): Promise<WolaiDatabaseContent | null> {
+    async getDatabaseContent(databaseId: string, pageSize = 200, startCursor?: string): Promise<WolaiDatabaseContent> {
         const token = await this.getValidToken();
         if (!token) {
-            return null;
+            throw new Error('Unable to obtain Wolai token');
         }
 
         try {
@@ -323,15 +330,13 @@ export class WolaiAPI {
                     next_cursor: responseData.next_cursor ?? responseData.data.next_cursor
                 };
             } else {
-                console.error('Failed to get database content:', responseData.message);
-                new Notice(`获取数据库内容失败: ${responseData.message}`);
-                return null;
+                throw new Error(responseData.message || `Missing database content for ${databaseId}`);
             }
         } catch (error) {
             if (this.isCancellationError(error)) throw error;
             console.error('Error getting database content:', error);
             new Notice('网络错误：无法获取数据库内容');
-            return null;
+            throw error;
         }
     }
 
@@ -339,17 +344,25 @@ export class WolaiAPI {
         const allRows: WolaiDatabaseRowData[] = [];
         let startCursor: string | undefined = undefined;
         let hasMore = true;
+        const seenCursors = new Set<string>();
 
         while (hasMore) {
-            const content: WolaiDatabaseContent | null = await this.getDatabaseContent(databaseId, 200, startCursor);
-            if (!content) {
-                break;
-            }
+            const content: WolaiDatabaseContent = await this.getDatabaseContent(databaseId, 200, startCursor);
 
             allRows.push(...content.rows);
 
-            hasMore = content.has_more === true && Boolean(content.next_cursor);
-            startCursor = hasMore ? content.next_cursor : undefined;
+            if (content.has_more === true) {
+                if (!content.next_cursor) throw new Error(`Missing next_cursor for database ${databaseId}`);
+                if (seenCursors.has(content.next_cursor)) {
+                    throw new Error(`Repeated pagination cursor for database ${databaseId}: ${content.next_cursor}`);
+                }
+                seenCursors.add(content.next_cursor);
+                startCursor = content.next_cursor;
+                hasMore = true;
+            } else {
+                startCursor = undefined;
+                hasMore = false;
+            }
         }
 
         console.log(`Retrieved total ${allRows.length} database rows`);
@@ -369,7 +382,7 @@ export class WolaiAPI {
 
             // 创建顶级块
             if (topLevelBlocks.length > 0) {
-                await this.createBlocksBatch(parentId, topLevelBlocks);
+                if (!await this.createBlocksBatch(parentId, topLevelBlocks)) return null;
             }
 
             // 对于嵌套块，目前暂时作为顶级块处理
@@ -382,7 +395,7 @@ export class WolaiAPI {
                     delete (cleanBlock as any).needsParent;
                     return cleanBlock;
                 });
-                await this.createBlocksBatch(parentId, cleanedNestedBlocks);
+                if (!await this.createBlocksBatch(parentId, cleanedNestedBlocks)) return null;
             }
 
             return parentId; // 返回父页面ID
@@ -462,6 +475,61 @@ export class WolaiAPI {
             }
 
         return true;
+    }
+
+    private cleanWritableBlock(block: WolaiBlock): Record<string, unknown> {
+        const clean: Record<string, unknown> = { type: block.type };
+        for (const key of [
+            'content', 'block_front_color', 'block_back_color', 'text_alignment',
+            'block_alignment', 'level', 'language'
+        ] as const) {
+            const value = block[key];
+            if (value !== undefined) clean[key] = value;
+        }
+        return clean;
+    }
+
+    async updateBlock(blockId: string, block: WolaiBlock): Promise<void> {
+        const token = await this.getValidToken();
+        if (!token) throw new Error('Unable to obtain Wolai token');
+        const response = await this.fetchWithRateLimit(`${this.baseUrl}/blocks/${blockId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', 'Authorization': token },
+            body: JSON.stringify(this.cleanWritableBlock(block))
+        });
+        if (!response.ok) throw new Error(`Failed to update block ${blockId}: HTTP ${response.status}`);
+    }
+
+    async deleteBlock(blockId: string): Promise<void> {
+        const token = await this.getValidToken();
+        if (!token) throw new Error('Unable to obtain Wolai token');
+        const response = await this.fetchWithRateLimit(`${this.baseUrl}/blocks/${blockId}`, {
+            method: 'DELETE',
+            headers: { 'Authorization': token }
+        });
+        if (!response.ok) throw new Error(`Failed to delete block ${blockId}: HTTP ${response.status}`);
+    }
+
+    /** Replace editable direct blocks while preserving nested child pages. */
+    async replacePageContent(pageId: string, blocks: WolaiBlock[]): Promise<void> {
+        const directBlocks = await this.getPageContent(pageId);
+        if (!directBlocks) throw new Error(`Unable to read Wolai page ${pageId}`);
+        const editableBlocks = directBlocks.filter(block => block.type !== 'page');
+        const common = Math.min(editableBlocks.length, blocks.length);
+        for (let index = 0; index < common; index++) {
+            const current = this.cleanWritableBlock(editableBlocks[index] as WolaiBlock);
+            const desired = this.cleanWritableBlock(blocks[index]);
+            if (JSON.stringify(current) !== JSON.stringify(desired)) {
+                await this.updateBlock(editableBlocks[index].id, blocks[index]);
+            }
+        }
+        if (blocks.length > common) {
+            const created = await this.createBlocks(pageId, blocks.slice(common));
+            if (!created) throw new Error(`Failed to append blocks to ${pageId}`);
+        }
+        for (let index = editableBlocks.length - 1; index >= blocks.length; index--) {
+            await this.deleteBlock(editableBlocks[index].id);
+        }
     }
 
     async retryWithExponentialBackoff<T>(

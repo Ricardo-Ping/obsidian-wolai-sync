@@ -23,7 +23,11 @@ sync-records.json
 wolai-api-quota.json
 wolai-generated-files.json
 wolai-incremental-state.json
+wolai-incremental-journal.jsonl
 wolai-resume-state.json
+wolai-file-queue.json
+*.json.tmp
+*.json.bak
 *.local.json
 .env
 .env.*

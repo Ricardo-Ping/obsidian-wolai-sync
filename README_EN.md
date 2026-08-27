@@ -14,7 +14,8 @@ An Obsidian community plugin for synchronizing Markdown notes, database records,
 - Page hierarchy mapping: every Wolai child page becomes an independent Markdown file under its parent's directory.
 - Incremental images stored in the corresponding page's `pictures/` directory.
 - Math conversion between Wolai inline/block equations and Obsidian MathJax `$...$` / `$$...$$` syntax.
-- Per-page checkpoints so interrupted or paused jobs can continue during the next incremental synchronization.
+- In-place updates and conflict protection: files with `wolai_id` update the existing page; concurrent changes stop and save the Wolai version under `_conflicts/`.
+- Atomic recovery state with one lightweight journal entry per completed page; parents are saved before descending into child trees.
 - Local rolling-hour API quota control with slow synchronization and automatic continuation.
 - Pause, resume, and stop controls for full and incremental jobs.
 - Safe cleanup only after a successful full synchronization; eligible stale files are moved to the system trash.
@@ -79,11 +80,11 @@ Reads all configured pages and database records again and writes their pages and
 
 ### Incremental two-way synchronization
 
-Reads lightweight metadata first and skips unchanged pages. Changed pages are fetched in full, while new, modified, and removed images are handled independently. A checkpoint is saved after each page completes successfully.
+Reads lightweight metadata first and skips unchanged pages. Changed pages are fetched in full, while new, modified, and removed images are handled independently. Each completed page appends a lightweight checkpoint, and a successful run atomically compacts the final state; parents are saved before recursion.
 
 ### Sync to Wolai only
 
-Writes pending Obsidian files to Wolai without running Wolai → Obsidian synchronization. Missing local files do not cause Wolai pages to be deleted.
+Writes pending Obsidian files to Wolai without running Wolai → Obsidian synchronization. Files with `wolai_id` update that page in place; files without one create a database record. Missing local files do not delete Wolai pages.
 
 ## Output Layout
 
@@ -113,7 +114,7 @@ Wolai may still return HTTP 429. The plugin honors `Retry-After` when supplied a
 - Scheduled synchronization and file watching are disabled by default.
 - Failed or cancelled full runs never trigger stale-file cleanup.
 - Cleanup only considers plugin-generated files recorded in its manifest and not manually modified by the user, and prefers moving them to the system trash.
-- Two-way synchronization can overwrite content. Back up both your vault and Wolai pages before the first run.
+- Concurrent local and remote edits are not overwritten automatically. The Wolai version is stored under `_conflicts/` and the run reports a conflict.
 
 ## Development
 
@@ -132,7 +133,7 @@ The repository contains source code only. It excludes `node_modules/`, local set
 
 - Wolai blocks and Markdown have different data models; complex nesting, some database properties, and special rich text may not convert losslessly.
 - Network failures, server-side rate limits, and monthly plan limits can still pause or fail a job.
-- Avoid editing the same page on both sides at the same time and keep backups for conflict recovery.
+- Editing the same page on both sides creates a conflict copy that must be merged manually before marking the file `Modified` again.
 - The plugin is not currently listed in the official Obsidian community plugin directory and must be installed manually.
 
 ## Origin and License

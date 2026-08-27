@@ -21,10 +21,15 @@ export interface SyncRecord {
     wolaiRowId: string;               // Wolai 行ID
     synced: boolean;                  // 是否已同步
     hash: string;                     // 文件内容哈希
+    remoteVersion?: number;           // 上次同步后的 Wolai 版本
+    remoteEditedAt?: number;          // 上次同步后的 Wolai 编辑时间
+    updateInProgress?: boolean;       // 上次原位更新是否被中断
+    pendingHash?: string;             // 被中断更新对应的本地内容哈希
+    updateStartedAt?: number;         // 原位更新开始时间
 }
 
 // 同步状态枚举
-export type SyncStatus = 'Synced' | 'Pending' | 'Modified' | 'Wait For Syncing';
+export type SyncStatus = 'Synced' | 'Pending' | 'Modified' | 'Conflict' | 'Wait For Syncing';
 
 // Obsidian文件的FrontMatter同步信息
 export interface FileSyncInfo {

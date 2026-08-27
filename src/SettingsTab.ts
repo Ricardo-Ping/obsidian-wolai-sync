@@ -483,7 +483,7 @@ export class WolaiSyncSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('增量双向同步')
-            .setDesc('只更新发生变化的页面和图片；新增、修改、删除均按块版本处理')
+            .setDesc('只更新发生变化的页面和图片；已有 wolai_id 原位更新，双端同时修改时生成冲突副本')
             .addButton(button => {
                 button
                     .setButtonText('开始增量同步')
