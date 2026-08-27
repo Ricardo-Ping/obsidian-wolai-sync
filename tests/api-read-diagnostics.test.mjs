@@ -89,3 +89,23 @@ test('API integration restores a read journal in a new instance and rechecks roo
     await second.clearPageReadCheckpoint('root');
     assert.equal(files.has('root'),false);
 });
+
+test('whole-table integration counts actual HTTP attempts including retries and never fetches cells',async()=>{
+    for(const retry of [false,true]){
+        const calls=[];let attempts=0,quota=0;
+        const shallow={id:'table',type:'table',version:2,edited_at:200,children:{ids:['cell1','cell2']}};
+        const detail={...shallow,table_setting:{has_header:false,column_widths:[100,100]},
+            table_content:[[{content:'001'},{content:[{title:'|x|',type:'equation'}]}]]};
+        const {api}=harness(async url=>{
+            const path=new URL(url).pathname;calls.push(path);
+            if(path==='/v1/blocks/root/children')return new Response(JSON.stringify({data:[shallow],has_more:false}));
+            assert.equal(path,'/v1/blocks/table');
+            if(retry&&++attempts===1)return new Response('',{status:503});
+            return new Response(JSON.stringify({data:detail}));
+        });
+        api.getValidToken=async()=>'test-token';api.beforeRequest=async()=>{quota++;};
+        assert.deepEqual(await api.getAllPageBlocks('root'),[detail]);
+        assert.equal(quota,retry?3:2);assert.equal(quota,calls.length);
+        assert.deepEqual(calls,['/v1/blocks/root/children',...Array(retry?2:1).fill('/v1/blocks/table')]);
+    }
+});

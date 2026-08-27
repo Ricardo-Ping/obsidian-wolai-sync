@@ -39,7 +39,7 @@ export interface APICallStats {
     hourlyLimit: number;
 }
 
-export interface WolaiBlockMetadata {
+export interface WolaiBlockMetadata extends WolaiPageBlock {
     id: string;
     type: string;
     version: number;
@@ -539,6 +539,9 @@ export class WolaiAPI {
     async replacePageContent(pageId: string, blocks: WolaiBlock[]): Promise<void> {
         const directBlocks = await this.getPageContent(pageId);
         if (!directBlocks) throw new Error(`Unable to read Wolai page ${pageId}`);
+        if (directBlocks.some(block => block.type === 'table' || block.type === 'simple_table')) {
+            throw new Error('TABLE_UPLOAD_UNSUPPORTED: 当前仅支持保真导入表格，未用普通文本覆盖 Wolai 原表');
+        }
         const editableBlocks = directBlocks.filter(block => block.type !== 'page');
         const common = Math.min(editableBlocks.length, blocks.length);
         for (let index = 0; index < common; index++) {
@@ -610,7 +613,7 @@ export class WolaiAPI {
         return new PageBlockReader((id, cursor) => this.getChildrenBatch(id, cursor),
             (level, message) => this.logCallback?.(level, message),
             () => this.throwIfCancelled(version), this.pageReadStore, this.appId,
-            id => this.getBlockMetadata(id));
+            id => this.getBlockMetadata(id), id => this.getBlockMetadata(id));
     }
 
     private async getChildrenBatch(pageId: string, cursor?: string): Promise<ChildrenBatch> {

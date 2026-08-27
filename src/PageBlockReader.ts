@@ -1,4 +1,5 @@
 import { WolaiPageBlock } from './types';
+import { isCompleteTextTable } from './WolaiTable';
 
 export interface PageRevision { version: number; edited_at: number }
 export interface ChildrenBatch { blocks: WolaiPageBlock[]; hasMore: boolean; nextCursor?: string }
@@ -19,6 +20,9 @@ interface Header extends PageRevision {
 interface CachedBatch extends ChildrenBatch {
     kind: 'batch'; blockId: string; cursor: string | null; version: number; edited_at: number;
 }
+interface CachedTable extends PageRevision {
+    kind: 'table'; blockId: string; block: WolaiPageBlock;
+}
 
 /** A short-lived, per-page read journal. Never used for outbound conflict checks. */
 export class PageBlockReader {
@@ -33,7 +37,8 @@ export class PageBlockReader {
         private checkCancelled: () => void,
         private store?: PageReadStore,
         private scope = '',
-        private verifyRevision?: (pageId: string) => Promise<PageRevision>
+        private verifyRevision?: (pageId: string) => Promise<PageRevision>,
+        private fetchTable?: (blockId: string) => Promise<WolaiPageBlock>
     ) {}
 
     async read(pageId: string, options: PageReadOptions = {}, expand = true): Promise<WolaiPageBlock[]> {
@@ -42,6 +47,7 @@ export class PageBlockReader {
         const persistent = Boolean(options.resume && revision &&
             (Number(revision.version) > 0 || Number(revision.edited_at) > 0) && this.store);
         const cache = new Map<string, CachedBatch>();
+        const tables = new Map<string, CachedTable>();
         const key = (id: string, cursor?: string | null): string => JSON.stringify([id, cursor || null]);
         let header: Header = {
             kind: 'header', schema: 1, pageId, scope: this.scope, startedAt: started,
@@ -62,7 +68,11 @@ export class PageBlockReader {
                         header = previous;
                         for (const line of lines.slice(1)) {
                             try {
-                                const entry: CachedBatch = JSON.parse(line);
+                                const entry: CachedBatch | CachedTable = JSON.parse(line);
+                                if (entry.kind === 'table' && typeof entry.blockId === 'string' &&
+                                    entry.block?.id === entry.blockId && isCompleteTextTable(entry.block)) {
+                                    tables.set(entry.blockId, entry);
+                                }
                                 if (entry.kind === 'batch' && typeof entry.blockId === 'string' &&
                                     (entry.cursor === null || typeof entry.cursor === 'string') &&
                                     Array.isArray(entry.blocks) && typeof entry.hasMore === 'boolean') {
@@ -86,6 +96,38 @@ export class PageBlockReader {
         let processedBatches = 0;
         const visited = new Set<string>();
         const output: WolaiPageBlock[] = [];
+        const fullTable = async (block: WolaiPageBlock): Promise<WolaiPageBlock | null> => {
+            if (isCompleteTextTable(block)) return block;
+            if (!this.fetchTable) return null;
+            this.checkCancelled();
+            const cached = tables.get(block.id);
+            const valid = cached && cached.version === Number(block.version || 0) &&
+                cached.edited_at === Number(block.edited_at || 0);
+            if (++processedBatches > this.maxBatches) throw new Error(`PAGE_READ_LIMIT: ${pageId}`);
+            options.onProgress?.(`正在整表读取 ${block.id}；网络 ${networkBatches} 批（重试另计），复用 ${cachedBatches} 批`);
+            const detail = valid ? cached.block : await this.fetchTable(block.id);
+            this.checkCancelled();
+            if (valid) cachedBatches++;
+            else networkBatches++;
+            if (detail.id !== block.id || detail.type !== 'table' ||
+                Number(detail.version || 0) !== Number(block.version || 0) ||
+                Number(detail.edited_at || 0) !== Number(block.edited_at || 0)) {
+                if (persistent) await this.store?.remove(pageId);
+                throw new Error(`PAGE_CHANGED_DURING_READ: 表格 ${block.id} 的版本变化，未写入混合版本`);
+            }
+            if (!isCompleteTextTable(detail)) {
+                this.log('WARN', `整表数据不完整或含不支持的单元格，保留逐块读取：${block.id}`);
+                return null;
+            }
+            if (!valid) {
+                const entry: CachedTable = { kind: 'table', blockId: block.id, block: detail,
+                    version: Number(block.version || 0), edited_at: Number(block.edited_at || 0) };
+                tables.set(block.id, entry);
+                if (persistent && this.store) await this.store.append(pageId, '\n' + JSON.stringify(entry) + '\n');
+            }
+            this.log('INFO', `整表读取完成：${block.id}；${detail.table_content.length} 行 × ${detail.table_content[0].length} 列；${valid ? '复用断点，0 次请求' : '1 次详情读取（重试另计）'}，跳过 ${detail.children.ids.length} 个单元格的逐格请求`);
+            return { ...block, ...detail, ...(valid ? { fromReadCheckpoint: true } : {}) };
+        };
         const children = async (blockId: string, parentRevision: PageRevision): Promise<WolaiPageBlock[]> => {
             const result: WolaiPageBlock[] = [];
             const ids = new Set<string>();
@@ -146,7 +188,8 @@ export class PageBlockReader {
 
         const walk = async (blocks: WolaiPageBlock[], ancestors: Set<string>, depth: number, parentId?: string): Promise<void> => {
             if (depth > this.maxDepth) throw new Error(`PAGE_DEPTH_LIMIT: ${pageId}`);
-            for (const block of blocks) {
+            for (const original of blocks) {
+                let block = original;
                 this.checkCancelled();
                 if (ancestors.has(block.id)) throw new Error(`PAGE_BLOCK_CYCLE: 页面 ${pageId}，块 ${block.id}`);
                 if (visited.has(block.id)) {
@@ -155,9 +198,14 @@ export class PageBlockReader {
                 }
                 visited.add(block.id);
                 if (visited.size > this.maxBlocks) throw new Error(`PAGE_READ_LIMIT: ${pageId} exceeds ${this.maxBlocks} blocks`);
+                let tableComplete = false;
+                if (expand && block.type === 'table') {
+                    const table = await fullTable(block);
+                    if (table) { block = table; tableComplete = true; }
+                }
                 output.push(parentId ? { ...block, isChildBlock: true, parentBlockId: parentId, depth } : block);
                 // Child pages are independent synchronization boundaries.
-                if (expand && block.type !== 'page' && block.children?.ids?.length) {
+                if (expand && !tableComplete && block.type !== 'page' && block.children?.ids?.length) {
                     const branch = new Set(ancestors);
                     branch.add(block.id);
                     const nested = await children(block.id, {

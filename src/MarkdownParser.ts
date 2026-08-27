@@ -4,6 +4,7 @@ import { unified } from 'unified';
 import remarkParse from 'remark-parse';
 import remarkMath from 'remark-math';
 import { ParsedMarkdown, WolaiBlock, MarkdownNode, SyncStatus, FileSyncInfo, CreateRichText, WolaiRichText, WolaiPageBlock } from './types';
+import { renderWolaiTable } from './WolaiTable';
 
 export class MarkdownParser {
     // Only used to verify a legacy note against the exact pre-math renderer.
@@ -510,7 +511,10 @@ export class MarkdownParser {
                 break;
 
             case 'table':
-                // 表格暂时作为文本处理
+                const tableMarkdown = renderWolaiTable(block);
+                // A tab-indented GFM table becomes a code block. Keep nested
+                // tables in reading order at page level so cells/math render.
+                if (tableMarkdown) return tableMarkdown;
                 blockContent = this.convertRichTextToMarkdown(block.content) || '*[表格内容]*';
                 break;
 

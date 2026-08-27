@@ -21,6 +21,8 @@ interface WolaiPageSyncState {
     remoteVersion: number;
     remoteEditedAt: number;
     converterVersion?: number;
+    tableRendererVersion?: number;
+    hasTables?: boolean;
     localHash?: string;
     localDirty?: boolean;
     children: Array<{ pageId: string; title: string; relativeDir: string }>;
@@ -475,7 +477,9 @@ export class SyncManager {
             editedAt: block.edited_at || 0,
             content: block.content,
             level: block.level,
-            parentBlockId: block.parentBlockId
+            parentBlockId: block.parentBlockId,
+            ...(block.table_content ? { tableContent: block.table_content, tableSetting: block.table_setting,
+                caption: block.caption } : {})
         }));
         return this.markdownParser.createHash(JSON.stringify(snapshot));
     }
@@ -742,6 +746,9 @@ export class SyncManager {
             const incrementalState = linkedPageId ? await this.loadIncrementalState() : {};
             const previousPage = linkedPageId ? incrementalState[linkedPageId] : undefined;
             const previousRecord = this.syncRecords.get(filePath);
+            if (previousPage?.hasTables || content.includes('<!-- wolai-table:') || content.includes('*[表格内容]*')) {
+                throw new Error('TABLE_UPLOAD_UNSUPPORTED: 含表格的页面暂不回写，避免破坏 Wolai 原表；请在 Wolai 修改表格');
+            }
             const pendingLocalHash = this.markdownParser.createHash(content);
 
             if (linkedPageId) {
@@ -1316,7 +1323,12 @@ export class SyncManager {
             const localModified = Boolean(existingFile instanceof TFile &&
                 (explicitlyDirty || previousPage?.localDirty ||
                     (effectiveBaselineHash && currentLocalHash !== effectiveBaselineHash)));
+            // Refresh only legacy table notes; do not invalidate every page just
+            // because this release adds a table renderer.
+            const needsTableUpgrade = previousPage?.tableRendererVersion !== 1 &&
+                existingContent.includes('*[表格内容]*');
             const localStateIsUsable = Boolean(previousPage &&
+                !needsTableUpgrade &&
                 previousPage.converterVersion === this.converterVersion &&
                 previousPage.filePath === fullFilePath &&
                 existingFile instanceof TFile && effectiveBaselineHash &&
@@ -1425,7 +1437,7 @@ export class SyncManager {
                     (previousPage ? previousPage.fingerprint !== fingerprint : false) ||
                     baselineVersion !== Number(metadata.version || 0) ||
                     baselineEditedAt !== Number(metadata.edited_at || 0));
-            const pageChanged = mode === 'full' || actualRemoteChanged ||
+            const pageChanged = mode === 'full' || actualRemoteChanged || needsTableUpgrade ||
                 previousPage?.converterVersion !== this.converterVersion ||
                 previousPage?.filePath !== fullFilePath || !(this.vault.getAbstractFileByPath(fullFilePath) instanceof TFile);
             // Compare the actual rendered note before classifying a conflict.
@@ -1503,7 +1515,17 @@ export class SyncManager {
                 await this.vault.modify(existingFile, markedContent);
                 resultingLocalDirty = true;
             } else if (pageChanged) {
-                const fullContent = matter.stringify(markdownContent, frontMatter);
+                if (needsTableUpgrade && existingFile instanceof TFile) {
+                    const directory = `${this.incrementalStatePath.slice(0, this.incrementalStatePath.lastIndexOf('/'))}/table-migration-backups`;
+                    if (!await this.vault.adapter.exists(directory)) await this.vault.adapter.mkdir(directory);
+                    const backupPath = `${directory}/${row.page_id.replace(/[^A-Za-z0-9_-]/g, '_')}-${currentLocalHash}.md`;
+                    if (await this.vault.adapter.exists(backupPath)) {
+                        if (await this.vault.adapter.read(backupPath) !== existingContent) throw new Error('Table migration backup collision');
+                    } else await this.vault.adapter.write(backupPath, existingContent);
+                    if (await this.vault.read(existingFile) !== existingContent) throw new Error('SYNC_LOCAL_CHANGED: 表格备份期间本地文件发生变化，未覆盖');
+                    void this.writeSyncLog('INFO', `迁移旧版表格格式，原文件备份：${backupPath}`);
+                }
+                const fullContent = matter.stringify(markdownContent, { ...existingData, ...frontMatter });
                 if (existingFile instanceof TFile) {
                     this.markInternalWrite(fullFilePath, fullContent);
                     await this.vault.modify(existingFile, fullContent);
@@ -1529,6 +1551,8 @@ export class SyncManager {
                 remoteVersion: Number(metadata.version || 0),
                 remoteEditedAt: Number(metadata.edited_at || 0),
                 converterVersion: this.converterVersion,
+                tableRendererVersion: 1,
+                hasTables: parentPageBlocks.some(block => block.type === 'table'),
                 localHash: writtenLocalHash,
                 localDirty: resultingLocalDirty,
                 children: childDescriptors,

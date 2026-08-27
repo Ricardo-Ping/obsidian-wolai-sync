@@ -27,6 +27,7 @@ wolai-incremental-journal.jsonl
 wolai-resume-state.json
 wolai-file-queue.json
 math-migration-backups/
+table-migration-backups/
 wolai-block-checkpoints/
 *.json.tmp
 *.json.bak

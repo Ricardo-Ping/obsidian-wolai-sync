@@ -139,6 +139,11 @@ export interface WolaiBlockChildren {
     ids: string[];
     api_url: string;
 }
+export interface WolaiTableCell { content: CreateRichText }
+export interface WolaiTableSetting {
+    has_header: boolean;
+    column_widths?: number[];
+}
 export interface WolaiPageBlock {
     id: string;
     type: string;
@@ -162,6 +167,9 @@ export interface WolaiPageBlock {
     isChildBlock?: boolean;
     parentBlockId?: string;
     depth?: number;
+    table_content?: WolaiTableCell[][];
+    table_setting?: WolaiTableSetting;
+    caption?: CreateRichText | null;
 }
 
 export interface WolaiPageResponse {

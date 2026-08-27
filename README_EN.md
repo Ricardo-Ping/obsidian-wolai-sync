@@ -114,6 +114,20 @@ Because the tree size is discovered during traversal, the UI uses an indetermina
 
 Read journals contain note content: treat them as private data. They are excluded from Git together with migration backups, credentials and sync state.
 
+### Whole-table reads and request reduction (1.3.4)
+
+`GET /blocks/{tableId}` can return a complete `table_content` matrix and `table_setting`, unlike the direct-children endpoint. The reader validates revision, dimensions, cell count and supported content before replacing per-cell traversal with one detail request. Unsupported/incomplete matrices fall back to the original traversal; network failures and changed revisions never become an empty successful table. Whole-table responses participate in the existing within-page checkpoint journal.
+
+- Supported text tables preserve cells, empty values, numerical strings (including leading/trailing zeros and percentages), line breaks, common rich text and inline math. Equivalent LaTeX `\vert{}` / `\Vert{}` commands avoid Markdown column separators changing absolute-value/norm formulas.
+- This is not pixel-identical rendering: widths, colors, merged cells and special embeds are not guaranteed. Headerless tables receive an empty Markdown header. Unsupported content falls back to block traversal and may remain plain text rather than a faithful table layout.
+- **Tables are inbound-only (Wolai → Obsidian).** Outbound synchronization of table-containing notes and replacement of existing remote tables are blocked to prevent destructive paragraph conversion. Edit those pages in Wolai.
+- Incremental sync refreshes legacy notes containing `*[表格内容]*`, without invalidating every ordinary page. Clean, baseline-verified legacy notes are backed up in `table-migration-backups/` before replacement. Missing baselines and local edits retain conflict protection.
+- Same-structure offline benchmark: 22 tables / 564 cells, **592 → 28** successful content requests (95.3% fewer). This is not an end-to-end live-page benchmark and excludes authentication, revision checks, images and retries. A live 7×6 table was checked cell-by-cell against the generated Markdown: all 42 text values matched.
+
+Nested tables render at page level in reading order to avoid becoming indented code blocks; original indentation is not retained. Unsupported-table fallback adds one detail probe over the original traversal. Detail-read batch counts exclude retries, while API accounting includes every HTTP attempt and retry.
+
+GFM parsing and MathJax glyph/bounding-box tests cover numerical strings, cell boundaries and formulas. No additional Obsidian math plugin is required. Test-only dependencies are not included in the runtime bundle. See [validation notes](docs/table-optimization-validation.md).
+
 ## Output Layout
 
 For a Wolai parent page named `Database Query Rewriting` with a child page named `GRewriter`:
