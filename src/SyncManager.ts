@@ -23,6 +23,10 @@ interface WolaiPageSyncState {
     images: Record<string, { version: number; editedAt: number; path: string }>;
 }
 type WolaiIncrementalState = Record<string, WolaiPageSyncState>;
+interface WolaiResumeState {
+    startedAt: number;
+    verifiedPageIds: Record<string, number>;
+}
 interface PageProgressContext {
     seen: Set<string>;
     total: number;
@@ -41,6 +45,7 @@ export class SyncManager {
     private metadataRequestWaiters: Array<() => void> = [];
     private readonly generatedManifestPath: string;
     private readonly incrementalStatePath: string;
+    private readonly resumeStatePath: string;
     private readonly syncLogPath: string;
     private readonly maxLogSize = 2 * 1024 * 1024;
     private readonly apiQuotaPath: string;
@@ -74,6 +79,7 @@ export class SyncManager {
         const runtimeDirectory = normalizePath(pluginDirectory);
         this.generatedManifestPath = normalizePath(`${runtimeDirectory}/wolai-generated-files.json`);
         this.incrementalStatePath = normalizePath(`${runtimeDirectory}/wolai-incremental-state.json`);
+        this.resumeStatePath = normalizePath(`${runtimeDirectory}/wolai-resume-state.json`);
         this.syncLogPath = normalizePath(`${runtimeDirectory}/sync.log`);
         this.apiQuotaPath = normalizePath(`${runtimeDirectory}/wolai-api-quota.json`);
         this.dataFilePath = normalizePath(`${runtimeDirectory}/sync-records.json`);
@@ -329,6 +335,28 @@ export class SyncManager {
 
     private async saveIncrementalState(state: WolaiIncrementalState): Promise<void> {
         await this.vault.adapter.write(this.incrementalStatePath, JSON.stringify(state, null, 2));
+    }
+
+    private async loadResumeState(): Promise<WolaiResumeState | null> {
+        try {
+            if (!await this.vault.adapter.exists(this.resumeStatePath)) return null;
+            const state = JSON.parse(await this.vault.adapter.read(this.resumeStatePath)) as WolaiResumeState;
+            if (!state.startedAt || Date.now() - state.startedAt > 24 * 60 * 60 * 1000) return null;
+            return state;
+        } catch (error) {
+            console.error('Failed to read Wolai resume state:', error);
+            return null;
+        }
+    }
+
+    private async saveResumeState(state: WolaiResumeState): Promise<void> {
+        await this.vault.adapter.write(this.resumeStatePath, JSON.stringify(state, null, 2));
+    }
+
+    private async clearResumeState(): Promise<void> {
+        if (await this.vault.adapter.exists(this.resumeStatePath)) {
+            await this.vault.adapter.remove(this.resumeStatePath);
+        }
     }
 
     /**
@@ -667,6 +695,18 @@ export class SyncManager {
         const previousState = await this.loadIncrementalState();
         const nextState: WolaiIncrementalState = {};
         const changedPages = new Set<string>();
+        const savedResume = mode === 'incremental' ? await this.loadResumeState() : null;
+        const resumeState: WolaiResumeState | undefined = mode === 'incremental'
+            ? savedResume || { startedAt: Date.now(), verifiedPageIds: {} }
+            : undefined;
+        if (resumeState) {
+            await this.saveResumeState(resumeState);
+            const verifiedCount = Object.keys(resumeState.verifiedPageIds).length;
+            if (verifiedCount > 0) {
+                this.reportProgress(48, `正在恢复上次中断的增量同步：已核验 ${verifiedCount} 个页面`);
+                void this.writeSyncLog('INFO', `发现增量同步断点，将复用 ${verifiedCount} 个已核验页面`);
+            }
+        }
         const progressContext: PageProgressContext = {
             seen: new Set<string>(),
             total: 0,
@@ -680,7 +720,7 @@ export class SyncManager {
             return await this.createOrUpdateObsidianFile({
                 page_id: page.pageId,
                 data: { '标题': { value: page.title } }
-            }, new Set(), '', generatedFiles, mode, previousState, nextState, changedPages, progressContext);
+            }, new Set(), '', generatedFiles, mode, previousState, nextState, changedPages, progressContext, resumeState);
         };
 
         // Keep page trees serial. Shared descendants, output paths and state maps
@@ -705,6 +745,7 @@ export class SyncManager {
         }
         if (pages.length > 0 && successCount === pages.length) {
             await this.saveIncrementalState(nextState);
+            await this.clearResumeState();
         }
 
         if (pages.length > 0) {
@@ -850,7 +891,8 @@ export class SyncManager {
         previousState: WolaiIncrementalState = {},
         nextState: WolaiIncrementalState = {},
         changedPages?: Set<string>,
-        progressContext?: PageProgressContext
+        progressContext?: PageProgressContext,
+        resumeState?: WolaiResumeState
     ): Promise<boolean> {
         try {
             await this.waitIfPaused();
@@ -870,17 +912,41 @@ export class SyncManager {
                 [syncFolder, relativeDir, filePath].filter(Boolean).join('/')
             );
             const previousPage = previousState[row.page_id];
-            const metadata = await this.getPageMetadataLimited(row.page_id);
-
-            const canFastSkip = mode === 'incremental' && previousPage &&
+            const localStateIsUsable = Boolean(previousPage &&
                 previousPage.converterVersion === this.converterVersion &&
-                previousPage.remoteVersion === Number(metadata.version || 0) &&
-                previousPage.remoteEditedAt === Number(metadata.edited_at || 0) &&
                 previousPage.filePath === fullFilePath &&
                 this.vault.getAbstractFileByPath(fullFilePath) instanceof TFile &&
                 Object.values(previousPage.images || {}).every(image =>
                     this.vault.getAbstractFileByPath(image.path) instanceof TFile) &&
-                Array.isArray(previousPage.children);
+                Array.isArray(previousPage.children));
+
+            // A failed incremental run leaves a short-lived journal. Pages that
+            // were already verified in that same run can be resumed locally;
+            // an ordinary new run still checks Wolai for remote changes.
+            const resumablePage = localStateIsUsable ? previousPage : undefined;
+            if (mode === 'incremental' && resumeState?.verifiedPageIds[row.page_id] && resumablePage) {
+                generatedFiles?.add(resumablePage.filePath);
+                for (const image of Object.values(resumablePage.images || {})) generatedFiles?.add(image.path);
+                nextState[row.page_id] = resumablePage;
+                for (const child of resumablePage.children) this.registerPageProgress(progressContext, child.pageId);
+                this.completePageProgress(progressContext);
+                for (const child of resumablePage.children) {
+                    const childSuccess = await this.createOrUpdateObsidianFile({
+                        page_id: child.pageId,
+                        data: { '标题': { value: child.title } }
+                    }, visitedPageIds, child.relativeDir, generatedFiles, mode, previousState, nextState,
+                    changedPages, progressContext, resumeState);
+                    if (!childSuccess) throw new Error(`Failed to resume child page ${child.pageId} of ${row.page_id}`);
+                }
+                void this.writeSyncLog('INFO', `从断点跳过已核验页面：${fullFilePath}`);
+                return true;
+            }
+            const metadata = await this.getPageMetadataLimited(row.page_id);
+
+            const canFastSkip = mode === 'incremental' && previousPage && localStateIsUsable &&
+                previousPage.remoteVersion === Number(metadata.version || 0) &&
+                previousPage.remoteEditedAt === Number(metadata.edited_at || 0) &&
+                previousPage.filePath === fullFilePath;
             if (canFastSkip) {
                 generatedFiles?.add(previousPage.filePath);
                 for (const image of Object.values(previousPage.images || {})) {
@@ -891,11 +957,18 @@ export class SyncManager {
                     this.registerPageProgress(progressContext, child.pageId);
                 }
                 this.completePageProgress(progressContext);
+                if (resumeState) {
+                    // Record the parent before descending. If a child later
+                    // fails, the next run need not query this parent again.
+                    resumeState.verifiedPageIds[row.page_id] = Date.now();
+                    await this.saveResumeState(resumeState);
+                }
                 for (const child of previousPage.children) {
                     const childSuccess = await this.createOrUpdateObsidianFile({
                         page_id: child.pageId,
                         data: { '标题': { value: child.title } }
-                    }, visitedPageIds, child.relativeDir, generatedFiles, mode, previousState, nextState, changedPages, progressContext);
+                    }, visitedPageIds, child.relativeDir, generatedFiles, mode, previousState, nextState,
+                    changedPages, progressContext, resumeState);
                     if (!childSuccess) throw new Error(`Failed to check child page ${child.pageId} of ${row.page_id}`);
                 }
                 console.log(`Fast-skipped unchanged Wolai page: ${pageName}`);
@@ -995,7 +1068,8 @@ export class SyncManager {
                 const childSuccess = await this.createOrUpdateObsidianFile({
                     page_id: child.pageId,
                     data: { '标题': { value: child.title } }
-                }, visitedPageIds, child.relativeDir, generatedFiles, mode, previousState, nextState, changedPages, progressContext);
+                }, visitedPageIds, child.relativeDir, generatedFiles, mode, previousState, nextState,
+                changedPages, progressContext, resumeState);
                 if (!childSuccess) throw new Error(`Failed to sync child page ${child.pageId} of ${row.page_id}`);
             }
 
@@ -1016,6 +1090,10 @@ export class SyncManager {
             // configured tree succeeds so an interrupted run cannot imply that
             // unseen pages were deleted.
             await this.saveIncrementalCheckpoint(previousState, nextState);
+            if (resumeState) {
+                resumeState.verifiedPageIds[row.page_id] = Date.now();
+                await this.saveResumeState(resumeState);
+            }
 
             void this.writeSyncLog('INFO',
                 `页面处理完成：${fullFilePath}；页面=${pageChanged ? '已更新' : '未变更'}；图片=${Object.keys(imageResult.images).length}；子页面=${childDescriptors.length}`);

@@ -67,11 +67,7 @@ export class WolaiAPI {
         private slowRateLimitDelay?: () => number | null
     ) {}
 
-    /**
-     * Serialize API request starts and retry rate-limited responses.  Wolai does
-     * not publish a stable per-second allowance, so a conservative interval is
-     * used and Retry-After is preferred whenever the server supplies it.
-     */
+    /** Serialize request starts and retry rate limits and transient failures. */
     private async fetchWithRateLimit(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
         const version = this.cancellationVersion;
         for (let attempt = 0; attempt <= this.maxRateLimitRetries; attempt++) {
@@ -90,24 +86,38 @@ export class WolaiAPI {
                 if (controller.signal.aborted || version !== this.cancellationVersion) {
                     throw new Error('WOLAI_SYNC_CANCELLED');
                 }
-                throw error;
+                if (attempt === this.maxRateLimitRetries) {
+                    this.logCallback?.('ERROR',
+                        `Wolai API 网络请求失败，已达最大重试次数 ${this.maxRateLimitRetries}：${String(error)}`);
+                    throw error;
+                }
+                const delay = this.getRetryDelay(null, attempt);
+                this.logCallback?.('WARN',
+                    `Wolai API 网络请求失败，${delay}ms 后重试 (${attempt + 1}/${this.maxRateLimitRetries})：${String(error)}`);
+                await this.waitCancellable(delay, version);
+                continue;
             } finally {
                 this.activeControllers.delete(controller);
             }
-            if (response.status !== 429) return response;
+
+            const transientStatus = [408, 425, 500, 502, 503, 504].includes(response.status);
+            if (response.status !== 429 && !transientStatus) return response;
 
             if (attempt === this.maxRateLimitRetries) {
-                this.logCallback?.('ERROR', `Wolai API HTTP 429，已达最大重试次数 ${this.maxRateLimitRetries}`);
+                this.logCallback?.('ERROR',
+                    `Wolai API HTTP ${response.status}，已达最大重试次数 ${this.maxRateLimitRetries}`);
                 return response;
             }
             const retryAfter = response.headers.get('Retry-After');
             let delay = this.getRetryDelay(retryAfter, attempt);
-            const slowDelay = this.slowRateLimitDelay?.();
-            if (slowDelay !== null && slowDelay !== undefined) delay = Math.max(delay, slowDelay);
+            if (response.status === 429) {
+                const slowDelay = this.slowRateLimitDelay?.();
+                if (slowDelay !== null && slowDelay !== undefined) delay = Math.max(delay, slowDelay);
+            }
             this.rateLimitUntil = Math.max(this.rateLimitUntil, Date.now() + delay);
-            console.warn(`Wolai API rate limited (429); retrying in ${delay}ms (${attempt + 1}/${this.maxRateLimitRetries})`);
+            console.warn(`Wolai API HTTP ${response.status}; retrying in ${delay}ms (${attempt + 1}/${this.maxRateLimitRetries})`);
             this.logCallback?.('WARN',
-                `Wolai API HTTP 429，${delay}ms 后重试 (${attempt + 1}/${this.maxRateLimitRetries})`);
+                `Wolai API HTTP ${response.status}，${delay}ms 后重试 (${attempt + 1}/${this.maxRateLimitRetries})`);
         }
         throw new Error('Unexpected Wolai rate-limit retry state');
     }
