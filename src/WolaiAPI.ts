@@ -55,6 +55,7 @@ export class WolaiAPI {
     private rateLimitUntil = 0;
     private readonly minimumRequestInterval = 1000;
     private readonly maxRateLimitRetries = 5;
+    private readonly requestTimeoutMs = 30_000;
     private cancellationVersion = 0;
     private activeControllers = new Set<AbortController>();
     private cancellationWaiters = new Set<() => void>();
@@ -79,11 +80,16 @@ export class WolaiAPI {
             this.throwIfCancelled(version);
             const controller = new AbortController();
             this.activeControllers.add(controller);
+            let timedOut = false;
+            const timeoutId = window.setTimeout(() => {
+                timedOut = true;
+                controller.abort();
+            }, this.requestTimeoutMs);
             let response: Response;
             try {
                 response = await fetch(input, { ...init, signal: controller.signal });
             } catch (error) {
-                if (controller.signal.aborted || version !== this.cancellationVersion) {
+                if (!timedOut && (controller.signal.aborted || version !== this.cancellationVersion)) {
                     throw new Error('WOLAI_SYNC_CANCELLED');
                 }
                 if (attempt === this.maxRateLimitRetries) {
@@ -97,6 +103,7 @@ export class WolaiAPI {
                 await this.waitCancellable(delay, version);
                 continue;
             } finally {
+                window.clearTimeout(timeoutId);
                 this.activeControllers.delete(controller);
             }
 

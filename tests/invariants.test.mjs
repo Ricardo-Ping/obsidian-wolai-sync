@@ -107,6 +107,7 @@ test('transient network failures retry and interrupted incremental runs resume',
     const gitignore = await read('.gitignore');
     assert.match(api, /Wolai API 网络请求失败/);
     assert.match(api, /\[408, 425, 500, 502, 503, 504\]/);
+    assert.match(api, /requestTimeoutMs = 30_000/);
     assert.match(manager, /wolai-resume-state\.json/);
     assert.match(manager, /从断点跳过已核验页面/);
     assert.match(manager, /await this\.clearResumeState\(\)/);
