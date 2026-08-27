@@ -538,7 +538,9 @@ export class MarkdownParser {
 
             case 'page':
                 const pageTitle = this.convertRichTextToMarkdown(block.content) || `Wolai_${block.id}`;
-                blockContent = `[[${pageTitle}]]`;
+                blockContent = block.localPagePath
+                    ? `[[${block.localPagePath.replace(/\.md$/i, '')}|${pageTitle.replace(/\|/g, '&#124;')}]]`
+                    : `[[${pageTitle}]]`;
                 break;
 
             default:

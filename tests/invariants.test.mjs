@@ -38,7 +38,8 @@ test('runtime and sensitive files are excluded from source control', async () =>
     for (const name of [
         'data.json', 'sync.log', 'sync-records.json', 'wolai-api-quota.json',
         'wolai-generated-files.json', 'wolai-incremental-state.json', 'wolai-incremental-journal.jsonl',
-        'wolai-resume-state.json', 'wolai-file-queue.json', 'math-migration-backups/', 'table-migration-backups/', 'wolai-block-checkpoints/', '*.json.tmp', '*.json.bak'
+        'wolai-resume-state.json', 'wolai-file-queue.json', 'math-migration-backups/', 'table-migration-backups/',
+        'pagination-migration-backups/', 'path-migration-backups/', 'wolai-page-paths.json', 'wolai-block-checkpoints/', '*.json.tmp', '*.json.bak'
     ]) assert.match(ignore, new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 });
 

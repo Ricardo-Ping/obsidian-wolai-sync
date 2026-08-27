@@ -130,6 +130,15 @@ GFM parsing and MathJax glyph/bounding-box tests cover numerical strings, cell b
 
 ## Output Layout
 
+### Duplicate titles and legacy pagination repair (1.3.5)
+
+- Duplicate titles receive persistent ID-based paths. The existing owner keeps its filename; the other page uses `Title--shortID.md`, extending the ID when needed. Atomic `wolai-page-paths.json` reservations survive restart/resume and traversal-order changes without overwriting a different page.
+- Child directories, `pictures/`, and ambiguous page links follow the assigned path. Incremental sync selectively refreshes affected parent links; verified link-only migrations first back up the original note in `path-migration-backups/`.
+- Legacy pagination repair requires an actual repeated leaf text block ID in the response, an exact old fingerprint, an exact local-body match to the old output, and an unchanged remote revision. The original note is saved in `pagination-migration-backups/` before rewriting and clearing a stale conflict. Similar-looking paragraphs alone are never deduplicated; edits, insufficient evidence, or backup failures prevent overwrite.
+- Failure totals count each page ID once. Body verification/baseline reconciliation is no longer reported as an upload. Proven pagination repairs are deferred to inbound sync rather than writing duplicated content to Wolai. The upload-only button remains available but does not perform local migrations.
+
+Re-enable the upgraded plugin and run incremental sync; unchanged images need no new download. Path mappings and migration backups are private runtime data excluded from Git. See [validation notes](docs/path-pagination-validation.md).
+
 For a Wolai parent page named `Database Query Rewriting` with a child page named `GRewriter`:
 
 ```text

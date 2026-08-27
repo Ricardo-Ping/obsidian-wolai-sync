@@ -13,6 +13,8 @@ export interface PageReadOptions {
     metadata?: PageRevision;
     resume?: boolean;
     onProgress?: (message: string) => void;
+    /** Evidence only: exact old root pagination order, never used as sync output. */
+    onLegacyPagination?: (blocks: WolaiPageBlock[]) => void;
 }
 interface Header extends PageRevision {
     kind: 'header'; schema: 1; pageId: string; scope: string; startedAt: number;
@@ -96,6 +98,9 @@ export class PageBlockReader {
         let processedBatches = 0;
         const visited = new Set<string>();
         const output: WolaiPageBlock[] = [];
+        const legacyRoot: WolaiPageBlock[] = [];
+        const repeatedRoot: WolaiPageBlock[] = [];
+        let unprovenRootRepetition = false;
         const fullTable = async (block: WolaiPageBlock): Promise<WolaiPageBlock | null> => {
             if (isCompleteTextTable(block)) return block;
             if (!this.fetchTable) return null;
@@ -148,8 +153,15 @@ export class PageBlockReader {
                     throw new Error(`INVALID_BLOCK_BATCH: ${blockId}`);
                 }
                 let added = 0;
-                for (const block of batch.blocks) {
+                for (const [index, block] of batch.blocks.entries()) {
+                    if (blockId === pageId) legacyRoot.push(block);
                     if (ids.has(block.id)) {
+                        if (blockId === pageId) {
+                            repeatedRoot.push(block);
+                            if (page === 1 || index !== 0 || legacyRoot[legacyRoot.length - 2]?.id !== block.id) {
+                                unprovenRootRepetition = true;
+                            }
+                        }
                         this.log('WARN', `去重分页重复块：页面 ${pageId}，块 ${block.id}`);
                         continue;
                     }
@@ -226,6 +238,15 @@ export class PageBlockReader {
                 }
             }
             this.checkCancelled();
+            // Limit automatic migration evidence to duplicated leaf text blocks
+            // in a flat root list. Nested/shared references are not proof of the
+            // old pagination defect and must retain normal conflict protection.
+            if (repeatedRoot.length && !unprovenRootRepetition && output.length === new Set(legacyRoot.map(b => b.id)).size &&
+                output.every(b => !b.isChildBlock && b.type !== 'table') &&
+                repeatedRoot.every(b => ['text', 'heading'].includes(b.type) && !b.children?.ids?.length &&
+                    JSON.stringify(b) === JSON.stringify(legacyRoot.find(first => first.id === b.id)))) {
+                options.onLegacyPagination?.(legacyRoot);
+            }
             this.log('INFO', `页内读取完成：${pageId}；${output.length} 块，网络 ${networkBatches} 批，复用 ${cachedBatches} 批`);
             return output;
         } catch (error) {

@@ -170,6 +170,7 @@ export interface WolaiPageBlock {
     table_content?: WolaiTableCell[][];
     table_setting?: WolaiTableSetting;
     caption?: CreateRichText | null;
+    localPagePath?: string;
 }
 
 export interface WolaiPageResponse {

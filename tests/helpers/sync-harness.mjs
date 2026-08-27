@@ -122,9 +122,10 @@ export async function createHarness({ state = {}, records = {}, pages = {}, resu
             if (!pages[id] || pages[id].error) throw new Error(pages[id]?.error || `Unknown page ${id}`);
             return { id, version: 2, edited_at: 200, ...pages[id].metadata };
         },
-        getAllPageBlocks: async id => {
+        getAllPageBlocks: async (id, options = {}) => {
             requests.push(`blocks:${id}`);
             if (!pages[id] || pages[id].error) throw new Error(pages[id]?.error || `Unknown page ${id}`);
+            if (pages[id].legacyBlocks) options.onLegacyPagination?.(structuredClone(pages[id].legacyBlocks));
             return structuredClone(pages[id].blocks);
         },
         replacePageContent: async () => { throw new Error('Unexpected Wolai write in regression test'); },

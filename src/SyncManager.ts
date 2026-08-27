@@ -4,6 +4,7 @@ import { MarkdownParser } from './MarkdownParser';
 import { WolaiSyncSettings, SyncRecord, SyncStatus } from './types';
 import matter from 'gray-matter';
 import { PageReadStore } from './PageBlockReader';
+import { PagePaths, PagePathState, safePageName } from './PagePaths';
 
 type SyncMode = 'full' | 'incremental';
 export type SyncResultStatus = 'completed' | 'partial' | 'cancelled' | 'no_changes' | 'busy' | 'failed';
@@ -23,6 +24,7 @@ interface WolaiPageSyncState {
     converterVersion?: number;
     tableRendererVersion?: number;
     hasTables?: boolean;
+    childPathSignature?: string;
     localHash?: string;
     localDirty?: boolean;
     children: Array<{ pageId: string; title: string; relativeDir: string }>;
@@ -47,6 +49,8 @@ export class SyncManager {
     private apiStatsListeners = new Set<(stats: APICallStats) => void>();
     private currentProgress: number | null = 0;
     private inboundFailures = new Map<string, { path: string; error: string }>();
+    private outboundUnchangedFiles = new Set<string>();
+    private pagePaths?: PagePaths;
     private metadataRequestsActive = 0;
     private metadataRequestWaiters: Array<() => void> = [];
     private readonly generatedManifestPath: string;
@@ -469,6 +473,107 @@ export class SyncManager {
         }
     }
 
+    private async getPagePaths(): Promise<PagePaths> {
+        const root = normalizePath(this.settings.obsidianFolder || 'Wolai');
+        const scope = JSON.stringify([root, this.settings.wolaiAppId]);
+        if (this.pagePaths?.state.scope === scope) return this.pagePaths;
+        const file = `${this.incrementalStatePath.slice(0, this.incrementalStatePath.lastIndexOf('/'))}/wolai-page-paths.json`;
+        const saved = await this.readRuntimeJson<PagePathState>(file, { schema: 1, scope, pages: {} });
+        if (saved.schema !== 1 || !saved.pages || typeof saved.pages !== 'object' || Array.isArray(saved.pages) ||
+            Object.values(saved.pages).some(path => typeof path !== 'string')) {
+            throw new Error('INVALID_PAGE_PATH_REGISTRY: 路径映射损坏，未重新分配或覆盖文件');
+        }
+        const state: PagePathState = saved.scope === scope ? saved : { schema: 1, scope, pages: {} };
+        const paths = new PagePaths(root, state, async path => {
+            let file = this.vault.getAbstractFileByPath(path);
+            if (!file) {
+                const parent = this.vault.getAbstractFileByPath(path.slice(0, path.lastIndexOf('/')));
+                if (parent instanceof TFolder) file = parent.children.find(child =>
+                    child.path.normalize('NFC').toLowerCase() === path.normalize('NFC').toLowerCase()) || null;
+            }
+            if (!file) return null;
+            return { path: file.path, folder: file instanceof TFolder,
+                owner: file instanceof TFile ? String(matter(await this.vault.read(file)).data.wolai_id || '') : undefined };
+        }, next => this.writeRuntimeJsonAtomic(file, next));
+        const claimed = new Set<string>();
+        for (const [id, path] of Object.entries(state.pages)) {
+            const key = path.normalize('NFC').toLowerCase();
+            if (!/^[A-Za-z0-9_-]+$/.test(id) || !paths.valid(path) || claimed.has(key)) {
+                throw new Error('INVALID_PAGE_PATH_REGISTRY: 路径映射无效或重复，未覆盖文件');
+            }
+            claimed.add(key);
+        }
+        this.pagePaths = paths;
+        return paths;
+    }
+
+    private pageAssetLocation(pageId: string, title: string, relativeDir: string): { name: string; relativeDir: string } {
+        const path = this.pagePaths?.state.pages[pageId];
+        if (!path || !this.pagePaths?.valid(path)) return { name: safePageName(title), relativeDir };
+        const relative = path.slice(this.pagePaths.root.length + 1);
+        return { name: relative.slice(relative.lastIndexOf('/') + 1, -3),
+            relativeDir: relative.includes('/') ? relative.slice(0, relative.lastIndexOf('/')) : '' };
+    }
+
+    private async resolveChildren(children: WolaiPageSyncState['children'], previous: WolaiIncrementalState): Promise<void> {
+        if (!children.length) return;
+        const paths = await this.getPagePaths();
+        for (const child of children) await paths.resolve(child.pageId, child.title, child.relativeDir, previous[child.pageId]?.filePath);
+    }
+
+    private childPathSignature(children: WolaiPageSyncState['children']): string {
+        return this.markdownParser.createHash(JSON.stringify(children.map(c => [c.pageId, this.pagePaths?.state.pages[c.pageId]])));
+    }
+
+    private hasDisambiguatedChildren(children: WolaiPageSyncState['children']): boolean {
+        const names = children.map(c => safePageName(c.title).normalize('NFC').toLowerCase());
+        return new Set(names).size < names.length || children.some(c => {
+            const path = this.pagePaths?.state.pages[c.pageId];
+            const expected = [this.pagePaths?.root, c.relativeDir, `${safePageName(c.title)}.md`].filter(Boolean).join('/');
+            return path && path !== expected;
+        });
+    }
+
+    private pageBlockTitle(block: any): string {
+        const parts = Array.isArray(block.content) ? block.content : [block.content];
+        return parts.filter(Boolean).map((part: any) => typeof part === 'string' ? part : part.title || '').join('') || `Wolai_${block.id}`;
+    }
+
+    private canMigratePageLinks(content: string, pageId: string, previous: WolaiPageSyncState | undefined,
+        metadata: WolaiBlockMetadata, blocks: any[]): boolean {
+        const location = this.pageAssetLocation(pageId, previous?.title || '', previous?.relativeDir || '');
+        const childDirectory = [location.relativeDir, location.name].filter(Boolean).join('/');
+        const children = blocks.filter(b => b.type === 'page').map(b => ({ pageId: b.id, title: this.pageBlockTitle(b), relativeDir: childDirectory }));
+        return Boolean(previous && this.hasDisambiguatedChildren(children) &&
+            previous.remoteVersion === Number(metadata.version || 0) &&
+            previous.remoteEditedAt === Number(metadata.edited_at || 0) &&
+            previous.fingerprint === this.createPageFingerprint(blocks) &&
+            matter(content).data.wolai_id === pageId &&
+            this.markdownBodiesEqual(content, this.renderPageMarkdown(blocks, previous.title, pageId, previous.relativeDir, true, false, true)));
+    }
+
+    private canMigratePagination(content: string, pageId: string, previous: WolaiPageSyncState | undefined,
+        metadata: WolaiBlockMetadata, legacyBlocks: any[] | undefined): boolean {
+        return Boolean(previous && legacyBlocks?.length && new Set(legacyBlocks.map(b => b.id)).size < legacyBlocks.length &&
+            previous.converterVersion === this.converterVersion &&
+            previous.remoteVersion === Number(metadata.version || 0) &&
+            previous.remoteEditedAt === Number(metadata.edited_at || 0) &&
+            matter(content).data.wolai_id === pageId &&
+            previous.fingerprint === this.createPageFingerprint(legacyBlocks) &&
+            this.markdownBodiesEqual(content, this.renderPageMarkdown(legacyBlocks,
+                previous.title, pageId, previous.relativeDir, true, false, true)));
+    }
+
+    private async backupBeforePaginationMigration(pageId: string, content: string, kind = 'pagination'): Promise<string> {
+        const directory = `${this.incrementalStatePath.slice(0, this.incrementalStatePath.lastIndexOf('/'))}/${kind}-migration-backups`;
+        if (!await this.vault.adapter.exists(directory)) await this.vault.adapter.mkdir(directory);
+        const path = `${directory}/${pageId}-${this.markdownParser.createHash(content)}.md`;
+        if (await this.vault.adapter.exists(path)) {
+            if (await this.vault.adapter.read(path) !== content) throw new Error('Pagination migration backup collision');
+        } else await this.vault.adapter.write(path, content);
+        return path;
+    }
+
     private createPageFingerprint(blocks: any[]): string {
         const snapshot = blocks.map(block => ({
             id: block.id,
@@ -693,10 +798,12 @@ export class SyncManager {
     }
 
     private async syncObsidianToWolai(filePath: string): Promise<boolean> {
+        this.outboundUnchangedFiles.delete(filePath);
         try {
             await this.syncRecordsReady;
             // 检查文件是否正在同步中
             if (this.syncingFiles.has(filePath)) {
+                this.outboundUnchangedFiles.add(filePath);
                 console.log(`File ${filePath} is already being synced, skipping...`);
                 return true;
             }
@@ -719,6 +826,7 @@ export class SyncManager {
 
             // 检查同步状态
             if (!this.markdownParser.needsSync(parsedMarkdown.frontMatter)) {
+                this.outboundUnchangedFiles.add(filePath);
                 console.log(`File ${filePath} doesn't need sync (status: ${parsedMarkdown.frontMatter.sync_status})`);
                 return true;
             }
@@ -746,6 +854,10 @@ export class SyncManager {
             const incrementalState = linkedPageId ? await this.loadIncrementalState() : {};
             const previousPage = linkedPageId ? incrementalState[linkedPageId] : undefined;
             const previousRecord = this.syncRecords.get(filePath);
+            if (previousPage) {
+                await (await this.getPagePaths()).resolve(linkedPageId, previousPage.title, previousPage.relativeDir, filePath);
+                await this.resolveChildren(previousPage.children, incrementalState);
+            }
             if (previousPage?.hasTables || content.includes('<!-- wolai-table:') || content.includes('*[表格内容]*')) {
                 throw new Error('TABLE_UPLOAD_UNSUPPORTED: 含表格的页面暂不回写，避免破坏 Wolai 原表；请在 Wolai 修改表格');
             }
@@ -774,7 +886,10 @@ export class SyncManager {
                 // block edit. A local upload is rare enough to verify the full
                 // remote fingerprint before allowing destructive changes.
                 if (previousPage) {
-                    const remoteBlocks = await this.wolaiAPI.getAllPageBlocks(linkedPageId);
+                    let legacyPagination: any[] | undefined;
+                    const remoteBlocks = await this.wolaiAPI.getAllPageBlocks(linkedPageId, {
+                        onLegacyPagination: blocks => { legacyPagination = blocks; }
+                    });
                     const remoteChildIds = new Set(remoteBlocks.filter(block => block.type === 'page').map(block => block.id));
                     const remoteParentBlocks = remoteBlocks.filter(block =>
                         !block.parentBlockId || !remoteChildIds.has(block.parentBlockId));
@@ -782,6 +897,16 @@ export class SyncManager {
                     const remoteFingerprint = this.createPageFingerprint(remoteParentBlocks);
                     const remoteComparableMarkdown = this.renderPageMarkdown(remoteParentBlocks,
                         previousPage.title, linkedPageId, previousPage.relativeDir);
+                    if (this.canMigratePagination(content, linkedPageId, previousPage, metadataBefore, legacyPagination)) {
+                        this.outboundUnchangedFiles.add(filePath);
+                        void this.writeSyncLog('INFO', `已识别旧分页重复，未上传；等待增量双向同步安全迁移：${filePath}`);
+                        return true;
+                    }
+                    if (!this.markdownBodiesEqual(content, remoteComparableMarkdown) && this.canMigratePageLinks(content, linkedPageId, previousPage, metadataBefore, remoteParentBlocks)) {
+                        this.outboundUnchangedFiles.add(filePath);
+                        void this.writeSyncLog('INFO', `同名页面链接待安全迁移，未上传：${filePath}`);
+                        return true;
+                    }
                     if (this.markdownBodiesEqual(content, remoteComparableMarkdown)) {
                         if (await this.vault.read(file) !== content) {
                             throw new Error(`SYNC_LOCAL_CHANGED: 上传核验期间本地文件变化，请重试：${filePath}`);
@@ -806,6 +931,7 @@ export class SyncManager {
                             converterVersion: undefined
                         });
                         void this.writeSyncLog('INFO', `正文一致，已更新基线，无需上传或生成冲突：${filePath}`);
+                        this.outboundUnchangedFiles.add(filePath);
                         return true;
                     }
                     remoteChanged = remoteChanged ||
@@ -1166,11 +1292,18 @@ export class SyncManager {
     }
 
     private renderPageMarkdown(blocks: any[], pageName: string, pageId: string,
-        relativeDir: string, localImages = true, legacyMath = false): string {
+        relativeDir: string, localImages = true, legacyMath = false, legacyPaths = false): string {
         if (blocks.length === 0) return `# ${pageName}\n\n*此页面从 Wolai 同步，页面ID: ${pageId}*\n\n`;
+        const location = legacyPaths ? { name: pageName, relativeDir } : this.pageAssetLocation(pageId, pageName, relativeDir);
+        const pages = blocks.filter(b => b.type === 'page');
+        const childDirectory = [location.relativeDir, location.name].filter(Boolean).join('/');
+        const disambiguate = !legacyPaths && this.hasDisambiguatedChildren(pages.map(b => ({
+            pageId: b.id, title: this.pageBlockTitle(b), relativeDir: childDirectory
+        })));
         const renderedBlocks = blocks.map(block => ({
             ...block,
-            localPath: localImages ? this.getPageImagePath(block, pageName, relativeDir) : undefined
+            localPagePath: disambiguate && block.type === 'page' ? this.pagePaths?.state.pages[block.id] : undefined,
+            localPath: localImages ? this.getPageImagePath(block, location.name, location.relativeDir) : undefined
         }));
         const parser = legacyMath ? new MarkdownParser(true) : this.markdownParser;
         return parser.convertWolaiPageToMarkdown(renderedBlocks, pageName);
@@ -1299,15 +1432,12 @@ export class SyncManager {
             const pageName = data['名称']?.value || data['标题']?.value || data['文件名']?.value || `Page_${row.page_id}`;
             this.registerPageProgress(progressContext, row.page_id);
             this.reportPageProgress(progressContext, pageName, relativeDir);
-            const fileName = `${pageName.replace(/[<>:"/\\|?*]/g, '_')}.md`;
-            const filePath = fileName; // 强制使用根据页面名称生成的文件名，不使用数据库中的"文件路径"字段
-
-            // 确保文件路径在指定的同步文件夹内
-            const syncFolder = this.settings.obsidianFolder;
-            fullFilePath = normalizePath(
-                [syncFolder, relativeDir, filePath].filter(Boolean).join('/')
-            );
             const previousPage = previousState[row.page_id];
+            fullFilePath = await (await this.getPagePaths()).resolve(row.page_id, pageName, relativeDir, previousPage?.filePath);
+            const assetLocation = this.pageAssetLocation(row.page_id, pageName, relativeDir);
+            const childDirectory = normalizePath([assetLocation.relativeDir, assetLocation.name].filter(Boolean).join('/'));
+            childrenToVisit = (previousPage?.children || []).map(child => ({ ...child, relativeDir: childDirectory }));
+            await this.resolveChildren(childrenToVisit, previousState);
             const previousRecord = this.syncRecords.get(fullFilePath);
             const existingFile = this.vault.getAbstractFileByPath(fullFilePath);
             const existingContent = existingFile instanceof TFile ? await this.vault.read(existingFile) : '';
@@ -1327,8 +1457,10 @@ export class SyncManager {
             // because this release adds a table renderer.
             const needsTableUpgrade = previousPage?.tableRendererVersion !== 1 &&
                 existingContent.includes('*[表格内容]*');
+            const needsPathUpgrade = this.hasDisambiguatedChildren(childrenToVisit) &&
+                previousPage?.childPathSignature !== this.childPathSignature(childrenToVisit);
             const localStateIsUsable = Boolean(previousPage &&
-                !needsTableUpgrade &&
+                !needsTableUpgrade && !needsPathUpgrade &&
                 previousPage.converterVersion === this.converterVersion &&
                 previousPage.filePath === fullFilePath &&
                 existingFile instanceof TFile && effectiveBaselineHash &&
@@ -1351,7 +1483,6 @@ export class SyncManager {
                 generatedFiles?.add(resumablePage.filePath);
                 for (const image of Object.values(resumablePage.images || {})) generatedFiles?.add(image.path);
                 nextState[row.page_id] = resumedState;
-                childrenToVisit = resumablePage.children;
                 for (const child of childrenToVisit) this.registerPageProgress(progressContext, child.pageId);
                 this.completePageProgress(progressContext);
                 pageProcessed = true;
@@ -1386,7 +1517,6 @@ export class SyncManager {
                     resumeState.verifiedPageIds[row.page_id] = Date.now();
                     await this.saveResumeState(resumeState);
                 }
-                childrenToVisit = previousPage.children;
                 console.log(`Fast-skipped unchanged Wolai page: ${pageName}`);
                 void this.writeSyncLog('INFO', `跳过未变更页面：${fullFilePath}`);
                 return await visitChildren();
@@ -1408,8 +1538,10 @@ export class SyncManager {
 
             // 获取页面内容
             console.log(`Getting content for page: ${row.page_id}`);
+            let legacyPagination: any[] | undefined;
             const pageBlocks = await this.wolaiAPI.getAllPageBlocks(row.page_id, {
                 metadata, resume: true,
+                onLegacyPagination: blocks => { legacyPagination = blocks; },
                 onProgress: message => this.reportProgress(null, `${[relativeDir, pageName].filter(Boolean).join(' / ')}；${message}`)
             });
             const childPages = (pageBlocks as any[]).filter(block => block.type === 'page');
@@ -1424,9 +1556,10 @@ export class SyncManager {
                 return {
                     pageId: child.id,
                     title: parts.filter(Boolean).map((part: any) => typeof part === 'string' ? part : part.title || '').join('') || `Wolai_${child.id}`,
-                    relativeDir: normalizePath([relativeDir, pageName.replace(/[<>:"/\\|?*]/g, '_')].filter(Boolean).join('/'))
+                    relativeDir: childDirectory
                 };
             });
+            await this.resolveChildren(childrenToVisit, previousState);
             for (const child of childrenToVisit) this.registerPageProgress(progressContext, child.pageId);
             const fingerprint = this.createPageFingerprint(parentPageBlocks);
             const baselineVersion = previousPage?.remoteVersion ?? previousRecord?.remoteVersion;
@@ -1437,7 +1570,7 @@ export class SyncManager {
                     (previousPage ? previousPage.fingerprint !== fingerprint : false) ||
                     baselineVersion !== Number(metadata.version || 0) ||
                     baselineEditedAt !== Number(metadata.edited_at || 0));
-            const pageChanged = mode === 'full' || actualRemoteChanged || needsTableUpgrade ||
+            const pageChanged = mode === 'full' || actualRemoteChanged || needsTableUpgrade || needsPathUpgrade ||
                 previousPage?.converterVersion !== this.converterVersion ||
                 previousPage?.filePath !== fullFilePath || !(this.vault.getAbstractFileByPath(fullFilePath) instanceof TFile);
             // Compare the actual rendered note before classifying a conflict.
@@ -1457,10 +1590,14 @@ export class SyncManager {
                 !localModified &&
                 this.markdownBodiesEqual(existingContent,
                     this.renderPageMarkdown(parentPageBlocks, pageName, row.page_id, relativeDir, true, true));
+            const paginationMigration = !bodiesEqual && existingFile instanceof TFile &&
+                this.canMigratePagination(existingContent, row.page_id, previousPage, metadata, legacyPagination);
+            const pathMigration = !bodiesEqual && existingFile instanceof TFile &&
+                this.canMigratePageLinks(existingContent, row.page_id, previousPage, metadata, parentPageBlocks);
             if (existingFile instanceof TFile && await this.vault.read(existingFile) !== existingContent) {
                 throw new Error(`SYNC_LOCAL_CHANGED: 核验期间本地文件发生变化，已保留，请重试：${fullFilePath}`);
             }
-            if (!bodiesEqual && !legacyMathMigration && (unknownLocalBaseline || (localModified && actualRemoteChanged))) {
+            if (!bodiesEqual && !legacyMathMigration && !paginationMigration && !pathMigration && (unknownLocalBaseline || (localModified && actualRemoteChanged))) {
                 const conflictPath = await this.writeConflictCopy(fullFilePath, row.page_id,
                     this.renderPageMarkdown(parentPageBlocks, pageName, row.page_id, relativeDir, false));
                 if (unknownLocalBaseline) {
@@ -1469,8 +1606,8 @@ export class SyncManager {
                 throw new Error(`SYNC_CONFLICT: local and Wolai changed; remote copy saved to ${conflictPath}`);
             }
             const imageResult = await this.downloadPageImages(
-                parentPageBlocks as any[], pageName, relativeDir, generatedFiles,
-                localModified || legacyMathMigration ? 'incremental' : mode, previousPage?.images || {}
+                parentPageBlocks as any[], assetLocation.name, assetLocation.relativeDir, generatedFiles,
+                localModified || legacyMathMigration || paginationMigration || pathMigration ? 'incremental' : mode, previousPage?.images || {}
             );
             if (existingFile instanceof TFile && await this.vault.read(existingFile) !== existingContent) {
                 throw new Error(`SYNC_LOCAL_CHANGED: 下载图片期间本地文件发生变化，已保留，请重试：${fullFilePath}`);
@@ -1480,7 +1617,23 @@ export class SyncManager {
             let resultingLocalDirty = Boolean(previousPage?.localDirty);
             let pageWritten = false;
             let baselineReconciled = false;
-            if (legacyMathMigration && existingFile instanceof TFile) {
+            if ((paginationMigration || pathMigration) && existingFile instanceof TFile) {
+                const latest = await this.getPageMetadataLimited(row.page_id);
+                if (Number(latest.version || 0) !== Number(metadata.version || 0) ||
+                    Number(latest.edited_at || 0) !== Number(metadata.edited_at || 0)) {
+                    throw new Error('PAGE_CHANGED_DURING_READ: 分页迁移前远端版本变化，未覆盖');
+                }
+                const backupPath = await this.backupBeforePaginationMigration(row.page_id, existingContent, paginationMigration ? 'pagination' : 'path');
+                await this.waitIfPaused();
+                if (await this.vault.read(existingFile) !== existingContent) throw new Error('SYNC_LOCAL_CHANGED: 分页备份期间本地文件变化，未覆盖');
+                const migrated = matter.stringify(markdownContent, { ...existingData, ...frontMatter });
+                this.markInternalWrite(fullFilePath, migrated);
+                await this.vault.modify(existingFile, migrated);
+                writtenLocalHash = this.markdownParser.createHash(migrated);
+                resultingLocalDirty = false;
+                pageWritten = true;
+                void this.writeSyncLog('INFO', `已核验并迁移${paginationMigration ? '旧分页重复块，解除误报冲突' : '同名页面链接'}：${fullFilePath}；原文件备份：${backupPath}`);
+            } else if (legacyMathMigration && existingFile instanceof TFile) {
                 const backupPath = await this.backupBeforeMathMigration(row.page_id, existingContent);
                 if (await this.vault.read(existingFile) !== existingContent) {
                     throw new Error(`SYNC_LOCAL_CHANGED: 迁移备份期间本地文件发生变化，已保留：${fullFilePath}`);
@@ -1553,6 +1706,7 @@ export class SyncManager {
                 converterVersion: this.converterVersion,
                 tableRendererVersion: 1,
                 hasTables: parentPageBlocks.some(block => block.type === 'table'),
+                childPathSignature: this.childPathSignature(childDescriptors),
                 localHash: writtenLocalHash,
                 localDirty: resultingLocalDirty,
                 children: childDescriptors,
@@ -1635,7 +1789,7 @@ export class SyncManager {
             const filePath = filesToSync[index];
             this.reportProgress((index / Math.max(1, filesToSync.length)) * 95,
                 `正在上传 ${index + 1}/${filesToSync.length}：${filePath}`);
-            if (await this.syncObsidianToWolai(filePath)) synced++;
+            if (await this.syncObsidianToWolai(filePath) && !this.outboundUnchangedFiles.has(filePath)) synced++;
             await new Promise(resolve => setTimeout(resolve, 500));
         }
         this.reportProgress(100, '仅同步到 Wolai 完成');
@@ -1725,15 +1879,19 @@ export class SyncManager {
 
         let obsidianToWolaiCount = 0;
         let obsidianToWolaiFailures = 0;
+        const failedKeys = new Set<string>();
         for (let index = 0; index < filesToSyncToWolai.length; index++) {
             const filePath = filesToSyncToWolai[index];
+            const file = this.vault.getAbstractFileByPath(filePath);
+            const linkedId = file instanceof TFile ? String(matter(await this.vault.read(file)).data.wolai_id || '') : '';
             this.reportProgress(10 + (index / Math.max(1, filesToSyncToWolai.length)) * 35,
                 `正在上传 ${index + 1}/${filesToSyncToWolai.length}：${filePath}`);
             const success = await this.syncObsidianToWolai(filePath);
             if (success) {
-                obsidianToWolaiCount++;
+                if (!this.outboundUnchangedFiles.has(filePath)) obsidianToWolaiCount++;
             } else {
                 obsidianToWolaiFailures++;
+                failedKeys.add(linkedId ? `page:${linkedId}` : `path:${filePath}`);
             }
             // 添加延迟避免API限制
             await new Promise(resolve => setTimeout(resolve, 500));
@@ -1742,12 +1900,13 @@ export class SyncManager {
         // 2. 同步 Wolai → Obsidian（状态为Wait For Syncing的行）
         this.reportProgress(48, '正在读取 Wolai 页面');
         const wolaiToObsidianCount = await this.syncWolaiToObsidian(mode, obsidianToWolaiFailures === 0);
+        for (const pageId of this.inboundFailures.keys()) failedKeys.add(`page:${pageId}`);
 
         const result: SyncResult = {
             obsidianToWolai: obsidianToWolaiCount,
             wolaiToObsidian: wolaiToObsidianCount,
-            failedPages: obsidianToWolaiFailures + this.inboundFailures.size,
-            status: obsidianToWolaiFailures + this.inboundFailures.size > 0 ? 'partial' :
+            failedPages: failedKeys.size,
+            status: failedKeys.size > 0 ? 'partial' :
                 obsidianToWolaiCount === 0 && wolaiToObsidianCount === 0 ? 'no_changes' : 'completed'
         };
 
@@ -1866,7 +2025,7 @@ export class SyncManager {
         let successCount = 0;
         for (const filePath of filePaths) {
             const success = await this.syncObsidianToWolai(filePath);
-            if (success) {
+            if (success && !this.outboundUnchangedFiles.has(filePath)) {
                 successCount++;
             }
             // 添加延迟避免API限制

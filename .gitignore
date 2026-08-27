@@ -28,6 +28,9 @@ wolai-resume-state.json
 wolai-file-queue.json
 math-migration-backups/
 table-migration-backups/
+pagination-migration-backups/
+path-migration-backups/
+wolai-page-paths.json
 wolai-block-checkpoints/
 *.json.tmp
 *.json.bak
