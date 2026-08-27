@@ -5,18 +5,19 @@ import { readFile } from 'node:fs/promises';
 const read = path => readFile(new URL(`../${path}`, import.meta.url), 'utf8');
 
 test('page blocks are synchronization boundaries', async () => {
-    const source = await read('src/WolaiAPI.ts');
+    const source = await read('src/PageBlockReader.ts');
     assert.match(source, /block\.type !== 'page'/);
-    assert.match(source, /parentBlockId: block\.id/);
+    assert.match(source, /parentBlockId: parentId/);
     assert.doesNotMatch(source, /expandedChildBlocks\.map/);
 });
 
 test('database and page children implement cursor pagination', async () => {
     const source = await read('src/WolaiAPI.ts');
+    const reader = await read('src/PageBlockReader.ts');
     assert.match(source, /content\.has_more === true/);
     assert.match(source, /start_cursor=\$\{encodeURIComponent\(cursor\)\}/);
-    assert.match(source, /has_more 但无 next_cursor/);
-    assert.match(source, /Repeated pagination cursor/);
+    assert.match(reader, /has_more 但无 next_cursor/);
+    assert.match(reader, /Repeated pagination cursor/);
 });
 
 test('page trees are serial and isolate child failures', async () => {
@@ -37,7 +38,7 @@ test('runtime and sensitive files are excluded from source control', async () =>
     for (const name of [
         'data.json', 'sync.log', 'sync-records.json', 'wolai-api-quota.json',
         'wolai-generated-files.json', 'wolai-incremental-state.json', 'wolai-incremental-journal.jsonl',
-        'wolai-resume-state.json', 'wolai-file-queue.json', 'math-migration-backups/', '*.json.tmp', '*.json.bak'
+        'wolai-resume-state.json', 'wolai-file-queue.json', 'math-migration-backups/', 'wolai-block-checkpoints/', '*.json.tmp', '*.json.bak'
     ]) assert.match(ignore, new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 });
 

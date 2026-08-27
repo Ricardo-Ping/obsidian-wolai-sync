@@ -233,3 +233,84 @@ test('failed upload prevents cleanup/finalization even if all configured imports
     assert.equal(result.failedPages, 1);
     assert.ok(h.vault.files.has(`${runtimeDir}/wolai-incremental-journal.jsonl`));
 });
+
+test('formula-only legacy note without any page state migrates after backup', async () => {
+    const h=await createHarness({pages:{root:{blocks:mathBlocks}}});
+    const original=note(h.manager.renderPageMarkdown(mathBlocks,'Root','root','',true,true),'root',{custom:'keep'});
+    h.vault.seed('Wolai/Root.md',original);
+    const result=await syncPage(h,{});
+    assert.equal(result.success,true);
+    assert.equal(h.vault.readPath(backups(h)[0]),original);
+    assert.equal(matter(h.vault.readPath('Wolai/Root.md')).data.custom,'keep');
+    assert.ok(result.nextState.root.localHash);
+    assert.equal(conflicts(h).length,0);
+});
+
+for(const change of ['text','formula','no-provenance','modified']) {
+    test(`no-state migration does not bypass real edits or missing provenance: ${change}`,async()=>{
+        const h=await createHarness({pages:{root:{blocks:mathBlocks}}});
+        let body=h.manager.renderPageMarkdown(mathBlocks,'Root','root','',true,true);
+        if(change==='text')body+='\nMy addition';
+        if(change==='formula')body=body.replace('e^{-x}','e^{-9x}');
+        const original=note(body,'root',change==='no-provenance'?{last_sync:''}:change==='modified'?{sync_status:'Modified'}:{});
+        h.vault.seed('Wolai/Root.md',original);
+        assert.equal((await syncPage(h,{})).success,false);
+        assert.equal(h.vault.readPath('Wolai/Root.md'),original);
+        assert.equal(backups(h).length,0);
+    });
+}
+
+test('page read cache is cleared only after the page baseline is durable',async()=>{
+    const h=await createHarness({pages:{root:{blocks:mathBlocks}}});
+    let cleared=false;
+    h.manager.wolaiAPI.clearPageReadCheckpoint=async id=>{
+        assert.ok((await h.manager.loadIncrementalState())[id]?.localHash);
+        cleared=true;
+    };
+    assert.equal((await syncPage(h,{})).success,true);
+    assert.equal(cleared,true);
+});
+
+test('runtime page read store supports backup recovery and rejects path traversal',async()=>{
+    const h=await createHarness();
+    const store=h.manager.createPageReadStore();
+    await store.reset('root','header\n');
+    await store.append('root','batch\n');
+    assert.equal(await store.read('root'),'header\nbatch\n');
+    const file=`${runtimeDir}/wolai-block-checkpoints/root.jsonl`;
+    await h.vault.adapter.rename(file,`${file}.bak`);
+    assert.equal(await store.read('root'),'header\nbatch\n');
+    await store.append('root','resumed\n');
+    assert.equal(await store.read('root'),'header\nbatch\nresumed\n');
+    await assert.rejects(store.reset('../data','bad'),/Invalid page/);
+    await store.remove('root');
+    assert.equal(await store.read('root'),null);
+});
+
+test('unchanged cached pictures need neither URL refresh nor another download',async()=>{
+    const h=await createHarness();
+    const image={id:'img',type:'image',version:2,edited_at:200,fromReadCheckpoint:true,
+        media:{download_url:'https://example.invalid/expired.png'}};
+    const path='Wolai/Root/pictures/img.png';
+    h.vault.seed(path,'cached-bytes');
+    const result=await h.manager.downloadPageImages([image],'Root','',new Set(),'incremental',{
+        img:{version:2,editedAt:200,path}
+    });
+    assert.equal(result.changed,false);
+    assert.deepEqual(h.requests,[]);
+});
+
+test('changed cached image invalidates page read journal and does not overwrite the note',async()=>{
+    const h=await createHarness({pages:{
+        root:{blocks:[{id:'img',type:'image',version:2,edited_at:200,fromReadCheckpoint:true,
+            media:{download_url:'https://example.invalid/expired.png'}}]},
+        img:{blocks:[],metadata:{version:3,edited_at:300,media:{download_url:'https://example.invalid/current.png'}}}
+    }});
+    let cleared=false;
+    h.manager.wolaiAPI.clearPageReadCheckpoint=async id=>{assert.equal(id,'root');cleared=true;};
+    const result=await syncPage(h,{});
+    assert.equal(result.success,false);
+    assert.equal(cleared,true);
+    assert.ok(!h.vault.files.has('Wolai/Root.md'));
+    assert.equal(result.nextState.root,undefined);
+});

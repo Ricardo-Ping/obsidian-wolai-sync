@@ -86,12 +86,13 @@ Reads lightweight metadata first and skips unchanged pages. Changed pages are fe
 
 Writes pending Obsidian files to Wolai without running Wolai → Obsidian synchronization. Files with `wolai_id` update that page in place; files without one create a database record. Missing local files do not delete Wolai pages.
 
-### Upgrading legacy state (1.3.2)
+### Upgrading legacy state (1.3.3)
 
 Reload the plugin and run incremental two-way sync; do not clear checkpoints or start over with a full sync. If a legacy record has no content hash, its Wolai page is read to verify the body first. File size or modification time alone never triggers an upload.
 
 - Matching bodies: preserve the local body and custom properties, refresh the baseline, clear false `Conflict` / `localDirty` markers left by 1.3.0, and continue to child pages.
 - Legacy math formatting only: for older-renderer notes still marked `Synced`, with unchanged remote metadata and no known local edits, reconstruct the old rendering from Wolai block types. Migrate to `$…$` / `$$…$$` only when the local body matches that rendering; never blindly strip dollar signs from Markdown. Back up the original file in the installed plugin's `math-migration-backups/` directory before writing, preserve custom properties, and reuse unchanged pictures.
+- When the entire historical page state is absent, the same backed-up migration is allowed only for a note with a matching `wolai_id`, `Synced` status, a valid `last_sync`, no other sync record, and an exact legacy-rendered body match. Other text, formula or image-reference changes, and `Modified` / `Conflict` status, do not bypass protection.
 - Missing historical baseline and different bodies: retain the local note, save a Wolai copy, and report `SYNC_BASELINE_UNKNOWN` for manual review instead of guessing which side is correct.
 - Known baselines with genuinely conflicting edits still receive conflict protection.
 
@@ -102,6 +103,16 @@ Initial verification of legacy pages requires API requests. Subsequent runs can 
 A page conflict or read failure is recorded without stopping later siblings. Children discovered from a conflicted parent are also processed. Cancellation still stops traversal. An incomplete run reports a summary of unresolved pages as **partially completed**, never “everything is up to date”; incomplete imports retain checkpoints and do not clean up old files or pictures. Resumed verification remains subject to the existing 24-hour validity window and local-file checks.
 
 Because the tree size is discovered during traversal, the UI uses an indeterminate progress bar with **processed / discovered** counts and the current path, instead of holding a misleading estimate at 94%. Processed counts include successful, skipped, and failed attempts; unresolved counts are summarized separately. Only an entirely successful run reaches 100%.
+
+### Within-page checkpoints for large pages (1.3.3)
+
+- Full and incremental imports append each successfully fetched children batch, including its cursor, to `wolai-block-checkpoints/` in the plugin directory. Interrupted reads can reuse batches after quota waits or reloads under the same page revision.
+- These are interrupted-read snapshots valid for up to 24 hours, not zero-API live change detection. The page revision is checked before resuming and again after resumed or long reads. Revision/account changes invalidate the snapshot. It is removed only after the note and its sync baseline are saved. Outbound conflict checks never reuse these snapshots.
+- Block IDs are de-duplicated. Cycles, repeated cursors, non-advancing pagination, and excessive depth/size produce explicit errors instead of unbounded requests. A response claiming another page without a usable cursor is no longer silently accepted as complete.
+- Logs include request sequence, method, endpoint path, status, duration, batch counts and cache reuse, without credentials, request bodies or signed image URLs. The 30-second deadline also covers response bodies. Temporary image URLs are refreshed only when a cached image actually needs downloading.
+- Older versions did not persist within-page reads, so those previously fetched batches cannot be recovered retroactively. The first read after upgrading starts building the journal. API quotas still apply.
+
+Read journals contain note content: treat them as private data. They are excluded from Git together with migration backups, credentials and sync state.
 
 ## Output Layout
 

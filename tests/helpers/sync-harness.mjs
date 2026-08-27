@@ -128,6 +128,7 @@ export async function createHarness({ state = {}, records = {}, pages = {}, resu
             return structuredClone(pages[id].blocks);
         },
         replacePageContent: async () => { throw new Error('Unexpected Wolai write in regression test'); },
+        clearPageReadCheckpoint: async () => {},
         cancelPendingRequests() {}
     };
     return { manager, vault, logs, requests, pages };

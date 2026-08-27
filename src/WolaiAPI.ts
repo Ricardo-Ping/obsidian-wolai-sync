@@ -1,4 +1,5 @@
 import { Notice } from 'obsidian';
+import { PageBlockReader, PageReadOptions, PageReadStore, ChildrenBatch } from './PageBlockReader';
 import {
     WolaiTokenResponse,
     WolaiCreateBlocksResponse,
@@ -44,6 +45,8 @@ export interface WolaiBlockMetadata {
     version: number;
     edited_at: number;
     parent_id?: string;
+    media?: WolaiPageBlock['media'];
+    url?: string;
 }
 
 export class WolaiAPI {
@@ -60,18 +63,22 @@ export class WolaiAPI {
     private cancellationVersion = 0;
     private activeControllers = new Set<AbortController>();
     private cancellationWaiters = new Set<() => void>();
+    private requestSerial = 0;
 
     constructor(
         private appId: string,
         private appSecret: string,
         private logCallback?: (level: 'INFO' | 'WARN' | 'ERROR', message: string) => void,
         private beforeRequest?: () => Promise<void>,
-        private slowRateLimitDelay?: () => number | null
+        private slowRateLimitDelay?: () => number | null,
+        private pageReadStore?: PageReadStore
     ) {}
 
     /** Serialize request starts and retry rate limits and transient failures. */
     private async fetchWithRateLimit(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
         const version = this.cancellationVersion;
+        const endpoint = new URL(typeof input === 'string' || input instanceof URL ? input.toString() : input.url).pathname;
+        const method = init?.method || 'GET';
         for (let attempt = 0; attempt <= this.maxRateLimitRetries; attempt++) {
             this.throwIfCancelled(version);
             await this.waitForRequestSlot(version);
@@ -79,6 +86,9 @@ export class WolaiAPI {
             // queue, so check the gate again immediately before network I/O.
             await this.beforeRequest?.();
             this.throwIfCancelled(version);
+            const requestId = ++this.requestSerial;
+            const startedAt = Date.now();
+            this.logCallback?.('INFO', `API #${requestId} ${method} ${endpoint} 开始（尝试 ${attempt + 1}）`);
             const controller = new AbortController();
             this.activeControllers.add(controller);
             let timedOut = false;
@@ -87,12 +97,27 @@ export class WolaiAPI {
                 controller.abort();
             }, this.requestTimeoutMs);
             let response: Response;
+            let receivedHeaders = false;
             try {
                 response = await fetch(input, { ...init, signal: controller.signal });
+                receivedHeaders = true;
+                // Keep the deadline active through the body, not only headers.
+                const body = await response.arrayBuffer();
+                response = new Response([204, 205, 304].includes(response.status) ? null : body, {
+                    status: response.status, statusText: response.statusText, headers: response.headers
+                });
+                this.logCallback?.('INFO', `API #${requestId} ${method} ${endpoint} HTTP ${response.status}，${Date.now() - startedAt}ms`);
             } catch (error) {
                 if (!timedOut && (controller.signal.aborted || version !== this.cancellationVersion)) {
                     throw new Error('WOLAI_SYNC_CANCELLED');
                 }
+                // A write may already have succeeded remotely. Do not replay
+                // mutations just because reading its response body timed out.
+                if (receivedHeaders && !['GET', 'HEAD'].includes(method.toUpperCase())) {
+                    this.logCallback?.('ERROR', `API #${requestId} ${method} ${endpoint} 响应读取失败，写入结果待核验，不自动重放`);
+                    throw error;
+                }
+                this.logCallback?.('WARN', `API #${requestId} ${method} ${endpoint} ${timedOut ? '超时' : '请求失败'}，${Date.now() - startedAt}ms`);
                 if (attempt === this.maxRateLimitRetries) {
                     this.logCallback?.('ERROR',
                         `Wolai API 网络请求失败，已达最大重试次数 ${this.maxRateLimitRetries}：${String(error)}`);
@@ -569,110 +594,36 @@ export class WolaiAPI {
     }
 
     async getPageContent(pageId: string): Promise<WolaiPageBlock[] | null> {
+        return await this.createPageReader().read(pageId, {}, false);
+    }
+
+    async getAllPageBlocks(pageId: string, options: PageReadOptions = {}): Promise<WolaiPageBlock[]> {
+        return await this.createPageReader().read(pageId, options);
+    }
+
+    async clearPageReadCheckpoint(pageId: string): Promise<void> {
+        await this.pageReadStore?.remove(pageId);
+    }
+
+    private createPageReader(): PageBlockReader {
+        const version = this.cancellationVersion;
+        return new PageBlockReader((id, cursor) => this.getChildrenBatch(id, cursor),
+            (level, message) => this.logCallback?.(level, message),
+            () => this.throwIfCancelled(version), this.pageReadStore, this.appId,
+            id => this.getBlockMetadata(id));
+    }
+
+    private async getChildrenBatch(pageId: string, cursor?: string): Promise<ChildrenBatch> {
         const token = await this.getValidToken();
-        if (!token) {
-            return null;
-        }
-
-        try {
-            const blocks: WolaiPageBlock[] = [];
-            let cursor: string | undefined;
-            const seenCursors = new Set<string>();
-            do {
-                const query = cursor ? `?page_size=200&start_cursor=${encodeURIComponent(cursor)}` : '?page_size=200';
-                const response = await this.fetchWithRateLimit(`${this.baseUrl}/blocks/${pageId}/children${query}`, {
-                    method: 'GET',
-                    headers: { 'Authorization': token }
-                });
-
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status} ${response.statusText}`);
-                }
-
-                const payload: WolaiPageResponse = await response.json();
-                if (!payload.data) throw new Error(payload.message || `Missing page content for ${pageId}`);
-                blocks.push(...payload.data);
-                if (payload.has_more === true) {
-                    const suppliedCursor = typeof payload.next_cursor === 'string' && payload.next_cursor
-                        ? payload.next_cursor : undefined;
-                    const fallbackCursor = payload.data.length >= 200
-                        ? payload.data[payload.data.length - 1]?.id : undefined;
-                    const nextCursor = suppliedCursor || fallbackCursor;
-                    if (!nextCursor) {
-                        // Some Wolai responses incorrectly mark has_more for a
-                        // short final page without returning next_cursor.
-                        this.logCallback?.('WARN',
-                            `页面 ${pageId} 返回 has_more 但无 next_cursor，已按最后一页处理`);
-                        cursor = undefined;
-                    } else if (seenCursors.has(nextCursor)) {
-                        throw new Error(`Repeated pagination cursor for ${pageId}: ${nextCursor}`);
-                    } else {
-                        seenCursors.add(nextCursor);
-                        cursor = nextCursor;
-                    }
-                } else {
-                    cursor = undefined;
-                }
-            } while (cursor);
-
-            console.log(`Retrieved page content with ${blocks.length} blocks`);
-            return blocks;
-        } catch (error) {
-            if (this.isCancellationError(error)) throw error;
-            console.error('Error getting page content:', error);
-            new Notice(`获取页面内容失败: ${String(error)}`);
-            throw error;
-        }
-    }
-
-    async getAllPageBlocks(pageId: string): Promise<WolaiPageBlock[]> {
-        const pageContent = await this.getPageContent(pageId);
-        if (!pageContent) {
-            throw new Error(`Unable to read Wolai page ${pageId}`);
-        }
-
-        // 递归获取所有子块
-        const allBlocks = await this.expandBlocksWithChildren(pageContent);
-        return allBlocks;
-    }
-
-    private async expandBlocksWithChildren(blocks: WolaiPageBlock[]): Promise<WolaiPageBlock[]> {
-        const expandedBlocks: WolaiPageBlock[] = [];
-
-        for (const block of blocks) {
-            // 添加当前块
-            expandedBlocks.push(block);
-
-            // Page blocks are synchronization boundaries. Their contents are
-            // fetched exactly once when the child page is processed separately.
-            if (block.type !== 'page' && block.children?.ids?.length) {
-                console.log(`Block ${block.id} has ${block.children.ids.length} children, fetching...`);
-
-                try {
-                    // 获取子块内容
-                    const childBlocks = await this.getPageContent(block.id);
-                    if (childBlocks && childBlocks.length > 0) {
-                        console.log(`Retrieved ${childBlocks.length} child blocks for ${block.id}`);
-
-                        const directChildren = childBlocks.map(childBlock => ({
-                            ...childBlock,
-                            isChildBlock: true,
-                            parentBlockId: block.id,
-                            depth: (block.depth || 0) + 1
-                        }));
-                        expandedBlocks.push(...await this.expandBlocksWithChildren(directChildren));
-                    }
-                } catch (error) {
-                    if (this.isCancellationError(error)) throw error;
-                    console.error(`Error fetching children for block ${block.id}:`, error);
-                    throw error;
-                }
-
-                // 添加延迟避免API限制
-                await new Promise(resolve => setTimeout(resolve, 200));
-            }
-        }
-
-        return expandedBlocks;
+        if (!token) throw new Error('Unable to obtain Wolai token');
+        const query = cursor ? `?page_size=200&start_cursor=${encodeURIComponent(cursor)}` : '?page_size=200';
+        const response = await this.fetchWithRateLimit(`${this.baseUrl}/blocks/${pageId}/children${query}`, {
+            method: 'GET', headers: { 'Authorization': token }
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
+        const payload: WolaiPageResponse = await response.json();
+        if (!Array.isArray(payload.data)) throw new Error(payload.message || `Missing page content for ${pageId}`);
+        return { blocks: payload.data, hasMore: payload.has_more === true,
+            nextCursor: typeof payload.next_cursor === 'string' && payload.next_cursor ? payload.next_cursor : undefined };
     }
 }

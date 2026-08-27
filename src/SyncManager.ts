@@ -3,6 +3,7 @@ import { WolaiAPI, WolaiDatabaseRowData, APICallStats, WolaiBlockMetadata } from
 import { MarkdownParser } from './MarkdownParser';
 import { WolaiSyncSettings, SyncRecord, SyncStatus } from './types';
 import matter from 'gray-matter';
+import { PageReadStore } from './PageBlockReader';
 
 type SyncMode = 'full' | 'incremental';
 export type SyncResultStatus = 'completed' | 'partial' | 'cancelled' | 'no_changes' | 'busy' | 'failed';
@@ -53,6 +54,7 @@ export class SyncManager {
     private readonly syncLogPath: string;
     private readonly maxLogSize = 2 * 1024 * 1024;
     private readonly apiQuotaPath: string;
+    private readonly blockCheckpointDirectory: string;
     private logWriteQueue: Promise<void> = Promise.resolve();
     private apiQuotaQueue: Promise<void> = Promise.resolve();
     private apiQuotaLoaded = false;
@@ -94,6 +96,7 @@ export class SyncManager {
         this.syncLogPath = normalizePath(`${runtimeDirectory}/sync.log`);
         this.apiQuotaPath = normalizePath(`${runtimeDirectory}/wolai-api-quota.json`);
         this.dataFilePath = normalizePath(`${runtimeDirectory}/sync-records.json`);
+        this.blockCheckpointDirectory = normalizePath(`${runtimeDirectory}/wolai-block-checkpoints`);
         this.wolaiAPI = this.createWolaiAPI(settings);
         this.markdownParser = new MarkdownParser();
         void this.loadApiQuota();
@@ -141,7 +144,36 @@ export class SyncManager {
                     }
                 }
             }, () => this.waitForApiPermission(),
-            () => settings.slowSync ? 60 * 60 * 1000 : null);
+            () => settings.slowSync ? 60 * 60 * 1000 : null, this.createPageReadStore());
+    }
+
+    private createPageReadStore(): PageReadStore {
+        const pathFor = (pageId: string): string => {
+            if (!/^[A-Za-z0-9_-]+$/.test(pageId)) throw new Error('Invalid page checkpoint ID');
+            return `${this.blockCheckpointDirectory}/${pageId}.jsonl`;
+        };
+        return {
+            read: async id => {
+                const path = pathFor(id);
+                const source = await this.vault.adapter.exists(path) ? path : `${path}.bak`;
+                if (!await this.vault.adapter.exists(source)) return null;
+                if (source !== path) await this.vault.adapter.rename(source, path);
+                return await this.vault.adapter.read(path);
+            },
+            reset: async (id, text) => {
+                if (!await this.vault.adapter.exists(this.blockCheckpointDirectory)) {
+                    await this.vault.adapter.mkdir(this.blockCheckpointDirectory);
+                }
+                await this.writeRuntimeTextAtomic(pathFor(id), text);
+            },
+            append: async (id, text) => { await this.vault.adapter.append(pathFor(id), text); },
+            remove: async id => {
+                for (const suffix of ['', '.bak', '.tmp']) {
+                    const path = pathFor(id) + suffix;
+                    if (await this.vault.adapter.exists(path)) await this.vault.adapter.remove(path);
+                }
+            }
+        };
     }
 
     private async loadApiQuota(): Promise<void> {
@@ -394,9 +426,13 @@ export class SyncManager {
     }
 
     private async writeRuntimeJsonAtomic(path: string, value: unknown): Promise<void> {
+        await this.writeRuntimeTextAtomic(path, JSON.stringify(value, null, 2));
+    }
+
+    private async writeRuntimeTextAtomic(path: string, text: string): Promise<void> {
         const temporaryPath = `${path}.tmp`;
         const backupPath = `${path}.bak`;
-        await this.vault.adapter.write(temporaryPath, JSON.stringify(value, null, 2));
+        await this.vault.adapter.write(temporaryPath, text);
         if (await this.vault.adapter.exists(backupPath)) await this.vault.adapter.remove(backupPath);
         if (await this.vault.adapter.exists(path)) await this.vault.adapter.rename(path, backupPath);
         try {
@@ -1167,7 +1203,7 @@ export class SyncManager {
         const nextImages: WolaiPageSyncState['images'] = {};
         for (const block of blocks) {
             if (block.type !== 'image') continue;
-            const downloadUrl = block.media?.download_url || block.url;
+            let downloadUrl = block.media?.download_url || block.url;
             if (!downloadUrl) continue;
 
             try {
@@ -1180,6 +1216,17 @@ export class SyncManager {
                 const needsDownload = mode === 'full' || !(existing instanceof TFile) ||
                     !previous || previous.version !== version || previous.editedAt !== editedAt || previous.path !== localPath;
                 if (needsDownload) {
+                    if (block.fromReadCheckpoint) {
+                        // Signed download links in a persisted batch may expire
+                        // while waiting for next hour's quota. Refresh only an
+                        // image that actually needs downloading.
+                        const fresh = await this.getPageMetadataLimited(block.id);
+                        if (Number(fresh.version || 0) !== version || Number(fresh.edited_at || 0) !== editedAt) {
+                            throw new Error(`CACHED_IMAGE_CHANGED: ${block.id}；请重试页面以读取最新内容`);
+                        }
+                        downloadUrl = fresh.media?.download_url || fresh.url;
+                        if (!downloadUrl) throw new Error(`Missing current image URL: ${block.id}`);
+                    }
                     changed = true;
                     const response = await requestUrl({ url: downloadUrl });
                     if (existing instanceof TFile) {
@@ -1193,6 +1240,8 @@ export class SyncManager {
                 block.localPath = localPath;
                 nextImages[block.id] = { version, editedAt, path: localPath };
             } catch (error) {
+                if (this.isCancellationError(error)) throw error;
+                if (String(error).includes('CACHED_IMAGE_CHANGED')) throw error;
                 failed = true;
                 console.error(`Failed to download Wolai image ${block.id}:`, error);
             }
@@ -1347,7 +1396,10 @@ export class SyncManager {
 
             // 获取页面内容
             console.log(`Getting content for page: ${row.page_id}`);
-            const pageBlocks = await this.wolaiAPI.getAllPageBlocks(row.page_id);
+            const pageBlocks = await this.wolaiAPI.getAllPageBlocks(row.page_id, {
+                metadata, resume: true,
+                onProgress: message => this.reportProgress(null, `${[relativeDir, pageName].filter(Boolean).join(' / ')}；${message}`)
+            });
             const childPages = (pageBlocks as any[]).filter(block => block.type === 'page');
             const childPageIds = new Set(childPages.map(block => block.id));
             const parentPageBlocks = (pageBlocks as any[]).filter(block =>
@@ -1382,11 +1434,15 @@ export class SyncManager {
             const markdownContent = this.renderPageMarkdown(parentPageBlocks, pageName, row.page_id, relativeDir);
             const bodiesEqual = existingFile instanceof TFile &&
                 this.markdownBodiesEqual(existingContent, markdownContent);
-            const legacyMathMigration = !bodiesEqual && existingFile instanceof TFile && previousPage &&
-                (previousPage.converterVersion ?? 0) < this.converterVersion &&
+            const legacyHistoryEligible = previousPage
+                ? (previousPage.converterVersion ?? 0) < this.converterVersion &&
+                    previousPage.remoteVersion === Number(metadata.version || 0) &&
+                    previousPage.remoteEditedAt === Number(metadata.edited_at || 0)
+                : unknownLocalBaseline && !previousRecord &&
+                    Number.isFinite(Date.parse(String(existingData.last_sync || '')));
+            const legacyMathMigration = !bodiesEqual && existingFile instanceof TFile && legacyHistoryEligible &&
                 existingData.wolai_id === row.page_id && existingData.sync_status === 'Synced' &&
-                !localModified && previousPage.remoteVersion === Number(metadata.version || 0) &&
-                previousPage.remoteEditedAt === Number(metadata.edited_at || 0) &&
+                !localModified &&
                 this.markdownBodiesEqual(existingContent,
                     this.renderPageMarkdown(parentPageBlocks, pageName, row.page_id, relativeDir, true, true));
             if (existingFile instanceof TFile && await this.vault.read(existingFile) !== existingContent) {
@@ -1496,6 +1552,10 @@ export class SyncManager {
             // Save this page before descending. A deep child failure can then
             // resume without downloading its already-completed ancestors.
             await this.appendIncrementalCheckpoint(row.page_id, nextState[row.page_id]);
+            // The page baseline is durable before its read journal is discarded.
+            await this.wolaiAPI.clearPageReadCheckpoint(row.page_id).catch(error => {
+                void this.writeSyncLog('WARN', `页面已保存，但页内缓存清理失败：${row.page_id}；${String(error)}`);
+            });
             if (resumeState) {
                 resumeState.verifiedPageIds[row.page_id] = Date.now();
                 await this.saveResumeState(resumeState, childDescriptors.length > 0);
@@ -1513,6 +1573,9 @@ export class SyncManager {
             if (resumeState && !pageProcessed) delete resumeState.verifiedPageIds[row.page_id];
             if (resumeState) await this.saveResumeState(resumeState, true).catch(() => undefined);
             if (this.isCancellationError(error)) throw error;
+            if (String(error).includes('CACHED_IMAGE_CHANGED')) {
+                await this.wolaiAPI.clearPageReadCheckpoint(row.page_id);
+            }
             this.inboundFailures.set(row.page_id, { path: fullFilePath, error: String(error) });
             if (!pageProcessed) this.completePageProgress(progressContext);
             console.error('Error creating/updating Obsidian file:', error);

@@ -142,6 +142,9 @@ export interface WolaiBlockChildren {
 export interface WolaiPageBlock {
     id: string;
     type: string;
+    version?: number;
+    edited_at?: number;
+    fromReadCheckpoint?: boolean;
     content?: CreateRichText;
     children?: WolaiBlockChildren;
     level?: number;
