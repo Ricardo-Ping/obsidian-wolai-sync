@@ -86,15 +86,22 @@ Reads lightweight metadata first and skips unchanged pages. Changed pages are fe
 
 Writes pending Obsidian files to Wolai without running Wolai → Obsidian synchronization. Files with `wolai_id` update that page in place; files without one create a database record. Missing local files do not delete Wolai pages.
 
-### Upgrading legacy state (1.3.1)
+### Upgrading legacy state (1.3.2)
 
 Reload the plugin and run incremental two-way sync; do not clear checkpoints or start over with a full sync. If a legacy record has no content hash, its Wolai page is read to verify the body first. File size or modification time alone never triggers an upload.
 
 - Matching bodies: preserve the local body and custom properties, refresh the baseline, clear false `Conflict` / `localDirty` markers left by 1.3.0, and continue to child pages.
+- Legacy math formatting only: for older-renderer notes still marked `Synced`, with unchanged remote metadata and no known local edits, reconstruct the old rendering from Wolai block types. Migrate to `$…$` / `$$…$$` only when the local body matches that rendering; never blindly strip dollar signs from Markdown. Back up the original file in the installed plugin's `math-migration-backups/` directory before writing, preserve custom properties, and reuse unchanged pictures.
 - Missing historical baseline and different bodies: retain the local note, save a Wolai copy, and report `SYNC_BASELINE_UNKNOWN` for manual review instead of guessing which side is correct.
 - Known baselines with genuinely conflicting edits still receive conflict protection.
 
 Initial verification of legacy pages requires API requests. Subsequent runs can fast-skip using the new baselines. Upgrading does not clear existing checkpoints or conflict copies.
+
+### Isolated page failures and progress
+
+A page conflict or read failure is recorded without stopping later siblings. Children discovered from a conflicted parent are also processed. Cancellation still stops traversal. An incomplete run reports a summary of unresolved pages as **partially completed**, never “everything is up to date”; incomplete imports retain checkpoints and do not clean up old files or pictures. Resumed verification remains subject to the existing 24-hour validity window and local-file checks.
+
+Because the tree size is discovered during traversal, the UI uses an indeterminate progress bar with **processed / discovered** counts and the current path, instead of holding a misleading estimate at 94%. Processed counts include successful, skipped, and failed attempts; unresolved counts are summarized separately. Only an entirely successful run reaches 100%.
 
 ## Output Layout
 

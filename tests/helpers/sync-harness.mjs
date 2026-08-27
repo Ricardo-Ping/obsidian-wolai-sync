@@ -26,6 +26,7 @@ export class MemoryVault {
     constructor() {
         this.adapter = {
             exists: async path => this.files.has(path),
+            mkdir: async path => this.folder(path),
             read: async path => this.readPath(path),
             write: async (path, text) => { this.seed(path, text); this.writes.push(path); },
             append: async (path, text) => { this.seed(path, this.readPath(path) + text); this.writes.push(path); },

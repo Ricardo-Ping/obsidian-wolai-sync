@@ -45,7 +45,7 @@ export default class WolaiSyncPlugin extends Plugin {
 		this.syncManager = new SyncManager(this.app.vault, this.settings, pluginDirectory);
 		await this.loadFileSyncQueue();
 		this.syncManager.addProgressListener((percent, message) => {
-			this.updateStatusBar(`${percent}% ${message}`);
+			this.updateStatusBar(percent === null ? message : `${percent}% ${message}`);
 		});
 
 		// 初始化文件监听器
@@ -294,6 +294,7 @@ export default class WolaiSyncPlugin extends Plugin {
 			const totalSynced = result.obsidianToWolai + result.wolaiToObsidian;
 
 			this.updateStatusBar(result.status === 'failed' ? 'Sync Failed' :
+				result.status === 'partial' ? 'Sync Incomplete' :
 				result.status === 'busy' ? 'Sync Busy' : result.status === 'cancelled' ? 'Sync Cancelled' : 'Synced');
 
 			if (result.status === 'cancelled') {
@@ -302,6 +303,8 @@ export default class WolaiSyncPlugin extends Plugin {
 				new Notice('已有同步任务在运行');
 			} else if (result.status === 'failed') {
 				new Notice('手动同步失败，请查看同步日志');
+			} else if (result.status === 'partial') {
+				new Notice(`手动同步部分完成，${result.failedPages} 个页面未完成；断点已保留`);
 			} else if (totalSynced > 0) {
 				new Notice(`手动同步完成: Obsidian→Wolai ${result.obsidianToWolai}个文件, Wolai→Obsidian ${result.wolaiToObsidian}个文件`);
 			} else {
@@ -341,6 +344,7 @@ export default class WolaiSyncPlugin extends Plugin {
 					if (result.status === 'completed' || result.status === 'no_changes') await this.saveData(this.settings);
 
 					this.updateStatusBar(result.status === 'failed' ? 'Sync Failed' :
+						result.status === 'partial' ? 'Sync Incomplete' :
 						result.status === 'busy' ? 'Sync Busy' : result.status === 'cancelled' ? 'Sync Cancelled' : 'Synced');
 					console.log(`Scheduled sync finished with status: ${result.status}`);
 				} catch (error) {

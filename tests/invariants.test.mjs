@@ -19,10 +19,11 @@ test('database and page children implement cursor pagination', async () => {
     assert.match(source, /Repeated pagination cursor/);
 });
 
-test('page trees are serial and child failures propagate', async () => {
+test('page trees are serial and isolate child failures', async () => {
     const source = await read('src/SyncManager.ts');
     assert.doesNotMatch(source, /Promise\.all\(pages\.map\(syncPage\)\)/);
-    assert.match(source, /if \(!childSuccess\) throw new Error/);
+    assert.match(source, /if \(!success\) allSucceeded = false/);
+    assert.doesNotMatch(source, /if \(!childSuccess\) throw new Error/);
     assert.match(source, /mode === 'full'.*this\.settings\.safeCleanup/);
 });
 
@@ -36,7 +37,7 @@ test('runtime and sensitive files are excluded from source control', async () =>
     for (const name of [
         'data.json', 'sync.log', 'sync-records.json', 'wolai-api-quota.json',
         'wolai-generated-files.json', 'wolai-incremental-state.json', 'wolai-incremental-journal.jsonl',
-        'wolai-resume-state.json', 'wolai-file-queue.json', '*.json.tmp', '*.json.bak'
+        'wolai-resume-state.json', 'wolai-file-queue.json', 'math-migration-backups/', '*.json.tmp', '*.json.bak'
     ]) assert.match(ignore, new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 });
 
@@ -93,7 +94,7 @@ test('runtime state is atomic and page journals precede child traversal', async 
     assert.match(manager, /\.tmp/);
     assert.match(manager, /\.bak/);
     const checkpoint = manager.indexOf('appendIncrementalCheckpoint(row.page_id, nextState[row.page_id])');
-    const childLoop = manager.indexOf('for (const child of childDescriptors)', checkpoint);
+    const childLoop = manager.indexOf('return await visitChildren()', checkpoint);
     assert.ok(checkpoint >= 0 && childLoop > checkpoint);
 });
 

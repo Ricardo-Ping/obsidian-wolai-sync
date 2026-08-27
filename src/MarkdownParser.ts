@@ -6,6 +6,9 @@ import remarkMath from 'remark-math';
 import { ParsedMarkdown, WolaiBlock, MarkdownNode, SyncStatus, FileSyncInfo, CreateRichText, WolaiRichText, WolaiPageBlock } from './types';
 
 export class MarkdownParser {
+    // Only used to verify a legacy note against the exact pre-math renderer.
+    // Never strip dollar signs from arbitrary user Markdown to infer equality.
+    constructor(private readonly legacyMath = false) {}
 
     parseFrontMatter(content: string): ParsedMarkdown {
         try {
@@ -514,6 +517,11 @@ export class MarkdownParser {
             case 'block_equation':
             case 'equation':
                 // 数学公式
+                if (this.legacyMath) {
+                    const legacyEquation = this.convertRichTextToMarkdown(block.content);
+                    blockContent = block.type === 'equation' ? `$$\n${legacyEquation}\n$$` : legacyEquation;
+                    break;
+                }
                 const equation = this.extractEquationContent(block.content);
                 blockContent = `$$\n${equation}\n$$`;
                 break;
@@ -563,7 +571,7 @@ export class MarkdownParser {
         const richText = content as WolaiRichText;
         let result = richText.title || '';
 
-        if (richText.type === 'equation') {
+        if (richText.type === 'equation' && !this.legacyMath) {
             return `$${result}$`;
         }
 

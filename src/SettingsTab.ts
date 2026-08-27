@@ -392,6 +392,12 @@ export class WolaiSyncSettingTab extends PluginSettingTab {
         progressBar.value = 0;
         progressBar.style.width = '100%';
         progressBar.style.height = '12px';
+        const updateProgress = (percent: number | null, message: string): void => {
+            // The total tree size is unknown while discovering child pages.
+            if (percent === null) progressBar.removeAttribute('value');
+            else progressBar.value = percent;
+            progressText.setText(percent === null ? message : `${percent}% · ${message}`);
+        };
 
         new Setting(containerEl)
             .setName('暂停/继续同步')
@@ -448,10 +454,7 @@ export class WolaiSyncSettingTab extends PluginSettingTab {
                                 return;
                             }
 
-                            removeProgressListener = this.plugin.syncManager.addProgressListener((percent, message) => {
-                                progressBar.value = percent;
-                                progressText.setText(`${percent}% · ${message}`);
-                            });
+                            removeProgressListener = this.plugin.syncManager.addProgressListener(updateProgress);
 
                             const result = await this.plugin.syncManager.fullSync();
                             const totalSynced = result.obsidianToWolai + result.wolaiToObsidian;
@@ -462,14 +465,15 @@ export class WolaiSyncSettingTab extends PluginSettingTab {
                                 new Notice('已有同步任务在运行');
                             } else if (result.status === 'failed') {
                                 new Notice('完整同步失败，请查看同步日志');
+                            } else if (result.status === 'partial') {
+                                new Notice(`完整同步部分完成，${result.failedPages} 个页面未完成；断点已保留`);
                             } else if (totalSynced > 0) {
                                 new Notice(`同步完成！Obsidian→Wolai: ${result.obsidianToWolai}个文件，Wolai→Obsidian: ${result.wolaiToObsidian}个文件`);
                             } else {
                                 new Notice('没有文件需要同步');
                             }
 
-                            // 刷新API统计显示
-                            this.display();
+                            // API stats already update live; keep the final summary visible.
                         } catch (error) {
                             console.error('Manual sync failed:', error);
                             new Notice('同步失败，请查看控制台日志');
@@ -500,15 +504,12 @@ export class WolaiSyncSettingTab extends PluginSettingTab {
                                 new Notice('同步管理器未初始化');
                                 return;
                             }
-                            removeProgressListener = this.plugin.syncManager.addProgressListener((percent, message) => {
-                                progressBar.value = percent;
-                                progressText.setText(`${percent}% · ${message}`);
-                            });
+                            removeProgressListener = this.plugin.syncManager.addProgressListener(updateProgress);
                             const result = await this.plugin.syncManager.incrementalSync();
                             if (result.status === 'cancelled') new Notice('增量同步已取消');
                             if (result.status === 'busy') new Notice('已有同步任务在运行');
                             if (result.status === 'failed') new Notice('增量同步失败，请查看同步日志');
-                            this.display();
+                            if (result.status === 'partial') new Notice(`增量同步部分完成，${result.failedPages} 个页面未完成；断点已保留`);
                         } catch (error) {
                             console.error('Incremental sync failed:', error);
                             new Notice('增量同步失败，请查看控制台日志');
@@ -538,10 +539,7 @@ export class WolaiSyncSettingTab extends PluginSettingTab {
                                 new Notice('同步管理器未初始化');
                                 return;
                             }
-                            removeProgressListener = this.plugin.syncManager.addProgressListener((percent, message) => {
-                                progressBar.value = percent;
-                                progressText.setText(`${percent}% · ${message}`);
-                            });
+                            removeProgressListener = this.plugin.syncManager.addProgressListener(updateProgress);
                             const count = await this.plugin.syncManager.syncOnlyToWolai();
                             new Notice(count > 0 ? `已同步 ${count} 个文件到 Wolai` : '没有文件需要同步到 Wolai');
                             this.display();
