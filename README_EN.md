@@ -2,30 +2,38 @@
 
 [简体中文](README.md) | [English](README_EN.md)
 
-An Obsidian community plugin for synchronizing Markdown notes, database records, child pages, and images with Wolai.
+An Obsidian community plugin for synchronizing Markdown notes, database records, child pages, and images with Wolai. It supports rich text formats, multiple block types, and smart synchronization state management.
 
 > This project is an enhanced derivative of [MarswayRed/obsidian-wolai-sync](https://github.com/MarswayRed/obsidian-wolai-sync). It preserves the original copyright and license and is maintained by [Ricardo-Ping](https://github.com/Ricardo-Ping). Thanks to the original author, Li Wei, for the foundation of this project.
 
-## Features
+## ✨ Features
 
-- Full two-way synchronization between Obsidian and Wolai.
-- Incremental synchronization based on page versions, edit times, content fingerprints, and image state.
-- Direct synchronization of ordinary Wolai pages in addition to database records, including recursive child pages.
-- Page hierarchy mapping: every Wolai child page becomes an independent Markdown file under its parent's directory.
-- Incremental images stored in the corresponding page's `pictures/` directory.
-- Math conversion between Wolai inline/block equations and Obsidian MathJax `$...$` / `$$...$$` syntax.
-- In-place updates and conflict protection: files with `wolai_id` update the existing page; concurrent changes stop and save the Wolai version under `_conflicts/`.
-- Atomic recovery state with one lightweight journal entry per completed page; parents are saved before descending into child trees.
-- Local rolling-hour API quota control with slow synchronization and automatic continuation.
-- Pause, resume, and stop controls for full and incremental jobs.
-- Safe cleanup only after a successful full synchronization; eligible stale files are moved to the system trash.
-- Live progress and streaming logs for synchronization, API usage, HTTP 429 retries, successes, and errors.
-- Optional scheduled synchronization and file watching, both disabled by default on new installations.
-- One-way “Sync to Wolai” mode that does not delete Wolai content.
+- **🔄 Full two-way sync**: Content synchronization in both directions, Obsidian → Wolai and Wolai → Obsidian.
+- **⚡ Incremental two-way sync**: Skips unchanged content based on page revisions, edit times, content fingerprints, and image state.
+- **📄 Ordinary page sync**: Besides databases, one or more Wolai page URLs/IDs can be configured directly, with recursive child-page synchronization.
+- **🗂️ Page hierarchy mapping**: Every Wolai child page becomes an independent Markdown file under a directory named after its parent page.
+- **🖼️ Incremental image sync**: Images are stored in the page's own `pictures/` directory; only new or changed images are updated.
+- **🧮 Math conversion**: Two-way conversion between Wolai inline/block equations and Obsidian MathJax `$...$` / `$$...$$` syntax.
+- **📊 Efficient whole-table reads**: Reads a complete `table_content` in one detail request and converts supported text tables into Markdown rows and columns instead of fetching cells one by one (about 95.3% fewer requests in a same-structure test).
+- **🛡️ In-place updates and conflict protection**: Files with `wolai_id` update the existing page; concurrent local and remote changes stop the overwrite and save the Wolai version under `_conflicts/`.
+- **💾 Atomic checkpoints**: Each completed page appends a lightweight journal entry; large pages support within-page checkpoints and resume after interruption, quota waits, or reloads.
+- **⏳ API quota protection**: Local rolling-hour usage tracking with slow synchronization that respects your Wolai plan quota, including HTTP 429 backoff retries.
+- **⏯️ Task control**: Pause, resume, and stop full or incremental jobs.
+- **🧹 Safe cleanup**: Only after a successful full synchronization are plugin-generated, unmodified stale files moved to the system trash.
+- **📈 Live logs and progress**: Streaming progress for pages, API calls, 429 retries, successes, and errors.
+- **🕐 Scheduled sync and file watching**: Both optional and disabled by default on new installations to avoid unexpected API usage.
+- **🔒 Sync to Wolai only**: Keeps the original one-way writing ability without deleting Wolai content.
 
-## Installation
+## 📋 Installation
 
-### Build from source
+### Method 1: Manual installation (recommended)
+
+1. Obtain the plugin files (`main.js`, `manifest.json`, `styles.css`).
+2. Copy the whole plugin folder into `.obsidian/plugins/obsidian-wolai-sync/` in your vault.
+3. Restart Obsidian.
+4. Enable **Wolai Sync** under **Settings → Community plugins**.
+
+### Method 2: Build from source
 
 Node.js 18 or later is required.
 
@@ -45,101 +53,102 @@ Copy the following files into your Obsidian vault:
 └── styles.css
 ```
 
-Restart Obsidian and enable **Wolai Sync** under **Settings → Community plugins**.
+## 🎯 Use Cases
 
-## Wolai Configuration
+- **Knowledge management**: Sync notes from Obsidian to Wolai for team collaboration.
+- **Content publishing workflow**: Write in Obsidian and publish to Wolai automatically.
+- **Two-way backup**: Keep important content backed up on both platforms.
+- **Team collaboration**: Personal editing in Obsidian, shared discussion in Wolai.
+
+## ⚙️ Configuration
+
+### 1. Wolai API settings
 
 1. Create an application in the [Wolai Developer Center](https://www.wolai.com/developers).
-2. Obtain its App ID and App Secret, and grant it access to the target pages or database.
-3. Enter the following values in the plugin settings:
-   - Database ID when database synchronization is needed;
-   - App ID;
-   - App Secret;
-   - Ordinary Wolai pages, optionally one per line as `Title | page URL or page ID`;
-   - The hourly API quota matching your Wolai plan.
-4. Select an Obsidian synchronization folder and use **Test connection** before the first run.
+2. Obtain its **App ID** and **App Secret**, and grant it access to the target pages or database.
+3. Enter the App ID and App Secret in the plugin settings.
 
-Configuration is stored only in the local Obsidian plugin data. Never commit `data.json`, logs, or synchronization state files.
+### 2. Obsidian settings
 
-## Database Fields
+- **Sync folder**: The Obsidian folder to synchronize (e.g., `Notes/Wolai`).
 
-Database synchronization retains the data model of the upstream project and requires at least:
+### 3. Sync settings
+
+- **Database ID**: Required when using database synchronization.
+- **Ordinary pages (optional)**: One per line as `Title | page URL or page ID`, with recursive child-page sync.
+- **Hourly API quota**: Match your current Wolai plan.
+- **Scheduled sync / interval**: Optional, disabled by default.
+- **File watching**: Optional, disabled by default.
+
+Use **Test connection** to verify the configuration. Configuration is stored only in local Obsidian plugin data; never commit `data.json`, logs, or synchronization state files.
+
+### Wolai database requirements
+
+When using database synchronization, the database needs at least the following fields:
 
 | Field | Type | Purpose |
 | --- | --- | --- |
-| Title (`标题`) | Title/text | Obsidian file title |
-| Sync status (`同步状态`) | Select | Values such as `Pending` and `Synced` |
+| Title | Title/text | Obsidian file title |
+| Sync status | Select | Values such as `Pending` and `Synced` |
 
 Recursive synchronization of ordinary pages does not require a database.
 
-## Synchronization Modes
+## 🚀 Usage
 
-### Full two-way synchronization
+### Manual sync
+
+Click the **Wolai Sync** ribbon icon, or click **Manual sync** in the plugin settings, to run a full two-way sync.
+
+### Force-sync the current file
+
+1. Open the Markdown file you want to sync.
+2. Command palette (Ctrl/Cmd + P) → search for **"Force sync current file"**.
+3. The plugin bypasses regular checks and writes the current file content to Wolai directly.
+
+### Scheduled sync (optional)
+
+Enable **Scheduled sync** in the settings and set an interval (5–120 minutes); the plugin runs incremental sync periodically.
+
+### File watching (optional)
+
+After enabling **File watching**, changes inside the sync folder are automatically queued for sync.
+
+### Sync status
+
+The plugin tracks sync state in each file's frontmatter:
+
+```yaml
+---
+sync_status: Synced
+wolai_id: "page_id_from_wolai"
+last_sync: "2024-01-15T10:30:00.000Z"
+---
+```
+
+- `Pending`: New file waiting for its first sync to Wolai.
+- `Modified`: The file was edited and needs to be re-synced to Wolai.
+- `Synced`: Successfully synced; no further action required.
+- `Wait For Syncing`: Marked in Wolai to be synced into Obsidian.
+
+### Sync modes
+
+#### Full two-way sync
 
 Reads all configured pages and database records again and writes their pages and images. Final state and safe cleanup are committed only when the entire run succeeds.
 
-### Incremental two-way synchronization
+#### Incremental two-way sync
 
 Reads lightweight metadata first and skips unchanged pages. Changed pages are fetched in full, while new, modified, and removed images are handled independently. Each completed page appends a lightweight checkpoint, and a successful run atomically compacts the final state; parents are saved before recursion.
 
-### Sync to Wolai only
+#### Sync to Wolai only
 
 Writes pending Obsidian files to Wolai without running Wolai → Obsidian synchronization. Files with `wolai_id` update that page in place; files without one create a database record. Missing local files do not delete Wolai pages.
 
-### Upgrading legacy state (1.3.3)
+## 📁 Output Layout
 
-Reload the plugin and run incremental two-way sync; do not clear checkpoints or start over with a full sync. If a legacy record has no content hash, its Wolai page is read to verify the body first. File size or modification time alone never triggers an upload.
+### Page hierarchy mapping
 
-- Matching bodies: preserve the local body and custom properties, refresh the baseline, clear false `Conflict` / `localDirty` markers left by 1.3.0, and continue to child pages.
-- Legacy math formatting only: for older-renderer notes still marked `Synced`, with unchanged remote metadata and no known local edits, reconstruct the old rendering from Wolai block types. Migrate to `$…$` / `$$…$$` only when the local body matches that rendering; never blindly strip dollar signs from Markdown. Back up the original file in the installed plugin's `math-migration-backups/` directory before writing, preserve custom properties, and reuse unchanged pictures.
-- When the entire historical page state is absent, the same backed-up migration is allowed only for a note with a matching `wolai_id`, `Synced` status, a valid `last_sync`, no other sync record, and an exact legacy-rendered body match. Other text, formula or image-reference changes, and `Modified` / `Conflict` status, do not bypass protection.
-- Missing historical baseline and different bodies: retain the local note, save a Wolai copy, and report `SYNC_BASELINE_UNKNOWN` for manual review instead of guessing which side is correct.
-- Known baselines with genuinely conflicting edits still receive conflict protection.
-
-Initial verification of legacy pages requires API requests. Subsequent runs can fast-skip using the new baselines. Upgrading does not clear existing checkpoints or conflict copies.
-
-### Isolated page failures and progress
-
-A page conflict or read failure is recorded without stopping later siblings. Children discovered from a conflicted parent are also processed. Cancellation still stops traversal. An incomplete run reports a summary of unresolved pages as **partially completed**, never “everything is up to date”; incomplete imports retain checkpoints and do not clean up old files or pictures. Resumed verification remains subject to the existing 24-hour validity window and local-file checks.
-
-Because the tree size is discovered during traversal, the UI uses an indeterminate progress bar with **processed / discovered** counts and the current path, instead of holding a misleading estimate at 94%. Processed counts include successful, skipped, and failed attempts; unresolved counts are summarized separately. Only an entirely successful run reaches 100%.
-
-### Within-page checkpoints for large pages (1.3.3)
-
-- Full and incremental imports append each successfully fetched children batch, including its cursor, to `wolai-block-checkpoints/` in the plugin directory. Interrupted reads can reuse batches after quota waits or reloads under the same page revision.
-- These are interrupted-read snapshots valid for up to 24 hours, not zero-API live change detection. The page revision is checked before resuming and again after resumed or long reads. Revision/account changes invalidate the snapshot. It is removed only after the note and its sync baseline are saved. Outbound conflict checks never reuse these snapshots.
-- Block IDs are de-duplicated. Cycles, repeated cursors, non-advancing pagination, and excessive depth/size produce explicit errors instead of unbounded requests. A response claiming another page without a usable cursor is no longer silently accepted as complete.
-- Logs include request sequence, method, endpoint path, status, duration, batch counts and cache reuse, without credentials, request bodies or signed image URLs. The 30-second deadline also covers response bodies. Temporary image URLs are refreshed only when a cached image actually needs downloading.
-- Older versions did not persist within-page reads, so those previously fetched batches cannot be recovered retroactively. The first read after upgrading starts building the journal. API quotas still apply.
-
-Read journals contain note content: treat them as private data. They are excluded from Git together with migration backups, credentials and sync state.
-
-### Whole-table reads and request reduction (1.3.4)
-
-`GET /blocks/{tableId}` can return a complete `table_content` matrix and `table_setting`, unlike the direct-children endpoint. The reader validates revision, dimensions, cell count and supported content before replacing per-cell traversal with one detail request. Unsupported/incomplete matrices fall back to the original traversal; network failures and changed revisions never become an empty successful table. Whole-table responses participate in the existing within-page checkpoint journal.
-
-- Supported text tables preserve cells, empty values, numerical strings (including leading/trailing zeros and percentages), line breaks, common rich text and inline math. Equivalent LaTeX `\vert{}` / `\Vert{}` commands avoid Markdown column separators changing absolute-value/norm formulas.
-- This is not pixel-identical rendering: widths, colors, merged cells and special embeds are not guaranteed. Headerless tables receive an empty Markdown header. Unsupported content falls back to block traversal and may remain plain text rather than a faithful table layout.
-- **Tables are inbound-only (Wolai → Obsidian).** Outbound synchronization of table-containing notes and replacement of existing remote tables are blocked to prevent destructive paragraph conversion. Edit those pages in Wolai.
-- Incremental sync refreshes legacy notes containing `*[表格内容]*`, without invalidating every ordinary page. Clean, baseline-verified legacy notes are backed up in `table-migration-backups/` before replacement. Missing baselines and local edits retain conflict protection.
-- Same-structure offline benchmark: 22 tables / 564 cells, **592 → 28** successful content requests (95.3% fewer). This is not an end-to-end live-page benchmark and excludes authentication, revision checks, images and retries. A live 7×6 table was checked cell-by-cell against the generated Markdown: all 42 text values matched.
-
-Nested tables render at page level in reading order to avoid becoming indented code blocks; original indentation is not retained. Unsupported-table fallback adds one detail probe over the original traversal. Detail-read batch counts exclude retries, while API accounting includes every HTTP attempt and retry.
-
-GFM parsing and MathJax glyph/bounding-box tests cover numerical strings, cell boundaries and formulas. No additional Obsidian math plugin is required. Test-only dependencies are not included in the runtime bundle. See [validation notes](docs/table-optimization-validation.md).
-
-## Output Layout
-
-### Duplicate titles and legacy pagination repair (1.3.5)
-
-- Duplicate titles receive persistent ID-based paths. The existing owner keeps its filename; the other page uses `Title--shortID.md`, extending the ID when needed. Atomic `wolai-page-paths.json` reservations survive restart/resume and traversal-order changes without overwriting a different page.
-- Child directories, `pictures/`, and ambiguous page links follow the assigned path. Incremental sync selectively refreshes affected parent links; verified link-only migrations first back up the original note in `path-migration-backups/`.
-- Legacy pagination repair requires an actual repeated leaf text block ID in the response, an exact old fingerprint, an exact local-body match to the old output, and an unchanged remote revision. The original note is saved in `pagination-migration-backups/` before rewriting and clearing a stale conflict. Similar-looking paragraphs alone are never deduplicated; edits, insufficient evidence, or backup failures prevent overwrite.
-- Failure totals count each page ID once. Body verification/baseline reconciliation is no longer reported as an upload. Proven pagination repairs are deferred to inbound sync rather than writing duplicated content to Wolai. The upload-only button remains available but does not perform local migrations.
-
-Re-enable the upgraded plugin and run incremental sync; unchanged images need no new download. Path mappings and migration backups are private runtime data excluded from Git. See [validation notes](docs/path-pagination-validation.md).
-
-For a Wolai parent page named `Database Query Rewriting` with a child page named `GRewriter`:
+Wolai child pages are saved as independent Markdown files under a directory named after their parent page, and each page's images live in its own `pictures/` directory. For example:
 
 ```text
 Wolai/
@@ -151,23 +160,101 @@ Wolai/
         └── pictures/
 ```
 
-Images belonging to each page are stored in that page's own `pictures/` directory.
+### Duplicate titles
 
-## API Limits and Slow Synchronization
+Duplicate titles in the same directory receive stable ID-based paths: the existing file keeps its name, while the other page uses `Title--shortID.md`, extending the ID when needed. Path mappings are saved atomically, so restarts, resumes, and traversal-order changes never swap filenames.
 
-Before an actual Wolai API request is sent, the plugin records a local timestamp and enforces the selected quota over a rolling 60-minute window. When the quota is exhausted, the current job remains queued until older requests leave the window. Local waiting checks do not consume API calls.
+## 📊 Large Pages and Whole-Table Optimization
+
+### Within-page checkpoints (large pages)
+
+- Full and incremental syncs append successfully fetched content batches, including cursors, to within-page checkpoints in the plugin directory. Interrupted reads can reuse batches after quota waits or reloads under the same page revision, without re-reading the whole page.
+- The page revision is checked before resuming; revision or account changes invalidate the cache. Checkpoints are cleared only after the note and its sync baseline are saved.
+- Block IDs are de-duplicated. Cycles, repeated cursors, non-advancing pagination, and excessive depth/size produce explicit errors instead of unbounded requests.
+- Logs include request sequence, method, endpoint path, status, and duration, without credentials, request bodies, or signed image URLs.
+
+### Whole-table reads
+
+`GET /blocks/{tableId}` can return a complete `table_content`. The reader validates the table revision, matrix dimensions, cell count, and content type before replacing per-cell traversal with one detail request; unsupported or incomplete details fall back to the original block traversal.
+
+- Supported text tables preserve cells, empty values, leading/trailing zeros, decimal places, percentages, line breaks, common rich text, and inline math. Equivalent LaTeX `\vert{}` / `\Vert{}` commands avoid Markdown column separators changing absolute-value/norm formulas.
+- This is not pixel-identical rendering: widths, colors, merged cells, and special embeds are not guaranteed.
+- **Tables are inbound-only (Wolai → Obsidian).** Outbound synchronization of table-containing notes is blocked; edit those pages in Wolai.
+- Same-structure test (22 tables / 564 cells): 592 → 28 content requests, about **95.3%** fewer.
+
+## ⏳ API Limits and Slow Synchronization
+
+Before an actual Wolai API request is sent, the plugin records a local timestamp and enforces the selected quota over a rolling 60-minute window. When the quota is exhausted, the current job remains queued until older requests leave the window; local waiting checks do not consume API calls.
 
 Wolai may still return HTTP 429. The plugin honors `Retry-After` when supplied and retries with backoff. Monthly limits cannot be avoided by delaying requests.
 
-## Safety
+## 🛠️ Supported Markdown Syntax
 
-- `App Secret`, local settings, logs, API counters, and incremental state are excluded through `.gitignore`.
-- Scheduled synchronization and file watching are disabled by default.
+### Text formats
+
+- **Bold**: `**bold**` or `__bold__`
+- *Italic*: `*italic*` or `_italic_`
+- `Inline code`: `` `code` ``
+- ~~Strikethrough~~: `~~strikethrough~~`
+- [Link](https://example.com): `[link text](URL)`
+
+### Block elements
+
+- Headings: `#` to `######`
+- Unordered list: `- item` or `* item`
+- Ordered list: `1. item`
+- Code block: ```` ```code``` ````
+- Quote: `> quoted text`
+- Divider: `---` or `***`
+
+## 🛡️ Safety
+
+- `App Secret`, plugin settings, logs, API counters, and incremental state are excluded through `.gitignore`.
+- Scheduled sync and file watching are disabled by default to avoid unexpected API usage.
 - Failed or cancelled full runs never trigger stale-file cleanup.
 - Cleanup only considers plugin-generated files recorded in its manifest and not manually modified by the user, and prefers moving them to the system trash.
-- Concurrent local and remote edits are not overwritten automatically. The Wolai version is stored under `_conflicts/` and the run reports a conflict.
+- Concurrent local and remote edits are not overwritten automatically. The Wolai version is stored under `_conflicts/`, and the run reports a conflict until it is resolved.
 
-## Development
+## ❗ Notes
+
+1. Back up important data before syncing.
+2. Use **Test connection** to verify the configuration before the first run.
+3. Make sure the Wolai application has access to the target pages/database.
+4. Avoid editing files during a sync to prevent conflict copies.
+5. Some special characters or complex nesting may need escaping or manual handling.
+
+## 🐛 Troubleshooting
+
+### 1. Connection failure
+
+- Check whether the App ID and App Secret are correct.
+- Confirm the application is connected to the Wolai workspace and has access to the target pages.
+- Verify your network connection.
+
+### 2. Sync failure
+
+- Inspect the Obsidian developer console (Ctrl+Shift+I) for error details.
+- Check whether the Wolai database fields are complete.
+- Confirm the file's frontmatter format is correct.
+
+### 3. Repeated sync
+
+- Check the file's `sync_status` value.
+- Confirm the sync status options in the Wolai database.
+- Check whether the hourly API quota has been reached.
+
+### 4. Conflict copies
+
+- Editing the same page on both sides creates a conflict copy; merge it manually and mark the file `Modified` again to continue.
+
+## 📋 Known Limitations
+
+- Wolai blocks and Markdown have different data models; complex nesting, some database properties, and special rich text may not convert losslessly.
+- Network failures, server-side rate limits, and monthly plan limits can still pause or fail a job.
+- Editing the same page on both sides creates a conflict copy that must be merged manually before marking the file `Modified` again.
+- The plugin is not currently listed in the official Obsidian community plugin directory and must be installed manually.
+
+## 🔧 Development
 
 ```bash
 npm install
@@ -180,19 +267,12 @@ npm run check
 
 The repository contains source code only. It excludes `node_modules/`, local settings, logs, synchronization state, and the generated `main.js`. A release package must contain `main.js`, `manifest.json`, and `styles.css`.
 
-## Known Limitations
-
-- Wolai blocks and Markdown have different data models; complex nesting, some database properties, and special rich text may not convert losslessly.
-- Network failures, server-side rate limits, and monthly plan limits can still pause or fail a job.
-- Editing the same page on both sides creates a conflict copy that must be merged manually before marking the file `Modified` again.
-- The plugin is not currently listed in the official Obsidian community plugin directory and must be installed manually.
-
-## Origin and License
+## 📄 License
 
 This project is a modified derivative of [MarswayRed/obsidian-wolai-sync](https://github.com/MarswayRed/obsidian-wolai-sync), which is based on the Obsidian Sample Plugin and uses a 0BSD-style license text.
 
 See [LICENSE](LICENSE) for copyright and licensing details. The original notice is preserved, and enhancements made in 2026 are copyrighted by Ricardo_PING.
 
-## Contributing
+## 🤝 Contributing
 
 Issues and pull requests are welcome. Before attaching diagnostic logs, remove App IDs, App Secrets, page IDs, page titles, and local filesystem paths.
